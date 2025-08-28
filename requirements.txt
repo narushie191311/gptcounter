@@ -1,0 +1,9 @@
+torch>=2.3.0,<2.6.0
+numpy>=1.26
+tqdm>=4.66
+opencv-python>=4.8
+pandas>=2.0
+insightface>=0.7.3
+onnxruntime>=1.18.0
+ultralytics>=8.2.0
+
