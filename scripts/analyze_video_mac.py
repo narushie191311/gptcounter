@@ -12,6 +12,17 @@ import numpy as np
 from insightface.app import FaceAnalysis
 import torch
 from ultralytics import YOLO
+import json
+import threading
+from datetime import datetime
+try:
+    import supervision as sv  # ByteTrack
+except Exception:
+    sv = None
+try:
+    from deep_sort_realtime.deepsort_tracker import DeepSort  # StrongSORT系
+except Exception:
+    DeepSort = None
 import base64
 from scipy.optimize import linear_sum_assignment
 import base64
@@ -360,6 +371,31 @@ def format_timestamp(sec_float: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
+class StatsAccumulator:
+    def __init__(self) -> None:
+        self.gender_to_count: Dict[str, int] = {"Male": 0, "Female": 0, "": 0}
+        self.gender_to_age_sum: Dict[str, float] = {"Male": 0.0, "Female": 0.0, "": 0.0}
+        self.gender_to_age_n: Dict[str, int] = {"Male": 0, "Female": 0, "": 0}
+
+    def update(self, age: Optional[int], gender: Optional[str]) -> None:
+        g = gender if gender in ("Male", "Female") else ""
+        self.gender_to_count[g] = self.gender_to_count.get(g, 0) + 1
+        if isinstance(age, (int, float)) and age and age > 0:
+            self.gender_to_age_sum[g] = self.gender_to_age_sum.get(g, 0.0) + float(age)
+            self.gender_to_age_n[g] = self.gender_to_age_n.get(g, 0) + 1
+
+    def means(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for g in self.gender_to_count.keys():
+            n = self.gender_to_age_n.get(g, 0)
+            out[g] = (self.gender_to_age_sum.get(g, 0.0) / n) if n > 0 else 0.0
+        return out
+
+
+def _ensure_dir(p: str) -> None:
+    os.makedirs(p or ".", exist_ok=True)
+
+
 def analyze_video(
     video_path: str,
     output_csv: str,
@@ -378,9 +414,25 @@ def analyze_video(
     w_face: float = 0.7,
     w_body: float = 0.3,
     device: str = "auto",
+    tracker_backend: str = "embed",
+    log_every_sec: float = 5.0,
+    checkpoint_every_sec: float = 60.0,
+    merge_every_sec: float = 60.0,
+    run_id: Optional[str] = None,
 ) -> None:
     face_app = init_face_app(det_w=int(det_size[0]), det_h=int(det_size[1]), device=device)
     yolo = init_person_detector(device=device)
+    # optional trackers
+    bytetrack = None
+    deepsort = None
+    if tracker_backend == "bytetrack":
+        if sv is None:
+            raise RuntimeError("supervision が見つかりません。pip install supervision してください。")
+        bytetrack = sv.ByteTrack()
+    elif tracker_backend == "strongsort":
+        if DeepSort is None:
+            raise RuntimeError("deep-sort-realtime が見つかりません。pip install deep-sort-realtime してください。")
+        deepsort = DeepSort(max_age=60, n_init=2, nms_max_overlap=1.0)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -396,8 +448,15 @@ def analyze_video(
     cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
 
     tracker = EmbeddingTracker(iou_gate=gate_iou, sim_gate=gate_sim, max_missed=int(fps * 2), reid=PersonRegistry(cosine_thresh=reid_cosine_thresh))
+    # attribute memory for external trackers
+    ext_attr: Dict[int, Dict[str, object]] = {}
 
-    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
+    out_dir = os.path.dirname(output_csv) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"run_{run_stamp}" if not run_id else f"run_{run_stamp}_{run_id}"
+    run_dir = os.path.join(out_dir, run_name)
+    _ensure_dir(run_dir)
     csv_file = open(output_csv, "w", newline="")
     writer = csv.writer(csv_file)
     writer.writerow(["timestamp", "frame", "person_id", "track_id", "age", "gender", "x", "y", "w", "h", "conf", "embedding_b64"])
@@ -413,6 +472,78 @@ def analyze_video(
         out_path = video_out_path or os.path.splitext(output_csv)[0] + ".mp4"
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
+    # Progress/Stats
+    stats = StatsAccumulator()
+    start_wall = time.time()
+    next_log_wall = start_wall + float(log_every_sec)
+    next_ckpt_wall = start_wall + float(checkpoint_every_sec)
+    next_merge_wall = start_wall + float(merge_every_sec) if merge_every_sec and merge_every_sec > 0 else float("inf")
+
+    def write_progress(now_wall: float) -> None:
+        processed_sec = max(0.0, min(duration_sec, (frame_idx / (cap.get(cv2.CAP_PROP_FPS) or 30.0)) - start_sec))
+        percent = float(processed_sec / duration_sec) if duration_sec > 0 else 0.0
+        elapsed = now_wall - start_wall
+        eta_sec = (elapsed / percent - elapsed) if percent > 1e-6 else None
+        eta_ts = (datetime.now() if eta_sec is None else datetime.fromtimestamp(now_wall + eta_sec)).strftime("%Y-%m-%d %H:%M:%S")
+        prog = {
+            "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "processed_sec": round(processed_sec, 3),
+            "percent": round(min(1.0, percent) * 100.0, 2),
+            "eta": eta_ts,
+            "fps": round(cap.get(cv2.CAP_PROP_FPS) or 30.0, 2),
+            "gender_count": stats.gender_to_count,
+            "gender_age_mean": {k: round(v, 2) for k, v in stats.means().items()},
+            "online_unique_persons": len(set([tr.person_id for tr in tracker.tracks.values() if tr.person_id is not None])),
+        }
+        try:
+            with open(os.path.join(run_dir, "progress.json"), "w") as f:
+                json.dump(prog, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        # 簡易ログ出力
+        print(f"[PROGRESS] {prog['percent']}% | persons={prog['online_unique_persons']} | M={prog['gender_count'].get('Male',0)} F={prog['gender_count'].get('Female',0)} ETA={prog['eta']}")
+
+    def checkpoint(now_wall: float) -> None:
+        # フラッシュして耐中断性を高める
+        try:
+            csv_file.flush()
+            try:
+                os.fsync(csv_file.fileno())
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # 進捗履歴に1行追記
+        try:
+            processed_sec = max(0.0, min(duration_sec, (frame_idx / (cap.get(cv2.CAP_PROP_FPS) or 30.0)) - start_sec))
+            percent = float(processed_sec / duration_sec) if duration_sec > 0 else 0.0
+            line = {
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "processed_sec": round(processed_sec, 3),
+                "percent": round(min(1.0, percent) * 100.0, 2),
+                "male": stats.gender_to_count.get("Male", 0),
+                "female": stats.gender_to_count.get("Female", 0),
+                "unknown": stats.gender_to_count.get("", 0),
+                "online_unique_persons": len(set([tr.person_id for tr in tracker.tracks.values() if tr.person_id is not None])),
+            }
+            hist_path = os.path.join(run_dir, "progress_history.jsonl")
+            with open(hist_path, "a") as f:
+                f.write(json.dumps(line, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def launch_merge_snapshot() -> None:
+        # 軽量: 現在のクラスタ数のみ算出して書き出し（高コストな再クラスタは避ける）
+        try:
+            data = {
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "online_unique_persons": len(set([tr.person_id for tr in tracker.tracks.values() if tr.person_id is not None]))
+            }
+            with open(os.path.join(run_dir, "merge_snapshot.json"), "w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
     try:
         while True:
             ret, frame = cap.read()
@@ -426,7 +557,7 @@ def analyze_video(
             if current_time_sec > end_time_video:
                 break
 
-            do_detect = (frame_idx - last_detect_frame) >= detect_every_n
+            do_detect = (frame_idx - last_detect_frame) >= (1 if tracker_backend in ("bytetrack", "strongsort") else detect_every_n)
             boxes: List[Tuple[int, int, int, int]] = []
             confidences: List[float] = []
             det_attrs: List[Tuple[int, str, Optional[np.ndarray]]] = []  # (age, gender, fused_emb)
@@ -481,21 +612,69 @@ def analyze_video(
                     for tr in tracker.tracks.values()
                 ]
 
-            det_embs = [e for (_, _, e) in det_attrs]
-            tracks = tracker.update(boxes, det_embs, frame_idx)
+            if tracker_backend == "embed":
+                det_embs = [e for (_, _, e) in det_attrs]
+                tracks = tracker.update(boxes, det_embs, frame_idx)
+            else:
+                # 外部トラッカー: person_boxesからのトラッキング
+                # 検出は person_boxes ベース（boxes/confidences も person ベースで構成済）
+                if tracker_backend == "bytetrack":
+                    # supervision の Detections: xyxy -> ByteTrack -> Detections(追跡ID付き)
+                    det_xyxy = []
+                    for (x, y, w, h) in boxes:
+                        det_xyxy.append([x, y, x + w, y + h])
+                    if len(det_xyxy) > 0:
+                        detections = sv.Detections(xyxy=np.array(det_xyxy, dtype=np.float32), confidence=np.array(confidences, dtype=np.float32))
+                    else:
+                        detections = sv.Detections.empty()
+                    tracked = bytetrack.update_with_detections(detections)
+                    tracks = []
+                    for (x1, y1, x2, y2), tid in zip(tracked.xyxy, tracked.tracker_id):
+                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                        tid = int(tid) if tid is not None else -1
+                        if tid == -1:
+                            continue
+                        tracks.append(Track(track_id=tid, box=(x1, y1, max(1, x2 - x1), max(1, y2 - y1)), last_seen_frame=frame_idx,
+                                            age=None, gender=None, hits=1, embedding=None, embedding_count=0, person_id=tid))
+                elif tracker_backend == "strongsort":
+                    ds_inputs = [([x + w/2, y + h/2, w, h], c, None) for (x, y, w, h), c in zip(boxes, confidences)]
+                    ds_tracks = deepsort.update_tracks(ds_inputs, frame=frame)
+                    tracks = []
+                    for t in ds_tracks:
+                        if not t.is_confirmed():
+                            continue
+                        l, tY, r, b = map(int, t.to_ltrb())
+                        tid = int(t.track_id)
+                        tracks.append(Track(track_id=tid, box=(l, tY, max(1, r - l), max(1, b - tY)), last_seen_frame=frame_idx,
+                                            age=None, gender=None, hits=1, embedding=None, embedding_count=0, person_id=tid))
 
-            # 直近検出結果に基づき、最もIoUが高い検出の属性をトラックへ反映
+            # 直近検出基づき属性付与（外部トラッカー時はここで埋め込み平均も管理）
             for tr in tracks:
-                # 最もIoUが高い検出の属性を反映（年齢/性別のみ）
                 best_i, best_idx = 0.0, None
                 for idx, b in enumerate(boxes):
                     val = iou(tr.box, b)
                     if val > best_i:
                         best_i, best_idx = val, idx
                 if best_idx is not None and best_idx < len(det_attrs):
-                    age, gender, _ = det_attrs[best_idx]
+                    age, gender, emb = det_attrs[best_idx]
                     tr.age = age
                     tr.gender = gender
+                    if tracker_backend != "embed":
+                        if emb is not None:
+                            mem = ext_attr.setdefault(tr.track_id, {"emb": None, "cnt": 0, "age": None, "gender": None})
+                            old = mem["emb"]
+                            if old is None:
+                                mem["emb"], mem["cnt"] = emb, 1
+                            else:
+                                a, b2 = pad_to_same_dim(np.asarray(old, dtype=np.float32), np.asarray(emb, dtype=np.float32))
+                                if a is not None and b2 is not None:
+                                    mix = (a * float(mem["cnt"]) + b2) / float(mem["cnt"] + 1)
+                                    n = float(np.linalg.norm(mix))
+                                    mem["emb"], mem["cnt"] = mix / max(n, 1e-6), mem["cnt"] + 1
+                            if mem.get("age") is None and age:
+                                mem["age"] = age
+                            if not mem.get("gender") and gender:
+                                mem["gender"] = gender
 
             # 描画とCSV
             for i, tr in enumerate(tracks):
@@ -510,9 +689,19 @@ def analyze_video(
                 ts_str = format_timestamp(current_time_sec)
                 conf_val = confidences[i] if i < len(confidences) else 1.0
                 emb_b64 = ""
-                if tr.embedding is not None:
+                emb_src = tr.embedding
+                if tracker_backend != "embed":
+                    mem = ext_attr.get(tr.track_id)
+                    if mem and isinstance(mem.get("emb"), np.ndarray):
+                        emb_src = mem.get("emb")
+                    # 可能なら属性も補完
+                    if (tr.age is None or tr.age == 0) and mem and mem.get("age"):
+                        tr.age = int(mem.get("age"))
+                    if (not tr.gender) and mem and mem.get("gender"):
+                        tr.gender = str(mem.get("gender"))
+                if emb_src is not None:
                     try:
-                        emb_b64 = base64.b64encode(tr.embedding.astype(np.float32).tobytes()).decode("ascii")
+                        emb_b64 = base64.b64encode(np.asarray(emb_src, dtype=np.float32).tobytes()).decode("ascii")
                     except Exception:
                         emb_b64 = ""
                 writer.writerow([
@@ -534,6 +723,22 @@ def analyze_video(
                     h, w = frame.shape[:2]
                     vw = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
                 vw.write(frame)
+
+            # 統計更新（フレーム単位で軽量更新）
+            for tr in tracks:
+                stats.update(tr.age, tr.gender)
+
+            # 定期ログ/チェックポイント/スナップショット
+            now_wall = time.time()
+            if now_wall >= next_log_wall:
+                write_progress(now_wall)
+                next_log_wall = now_wall + float(log_every_sec)
+            if now_wall >= next_ckpt_wall:
+                checkpoint(now_wall)
+                next_ckpt_wall = now_wall + float(checkpoint_every_sec)
+            if now_wall >= next_merge_wall:
+                threading.Thread(target=launch_merge_snapshot, daemon=True).start()
+                next_merge_wall = now_wall + float(merge_every_sec)
     finally:
         csv_file.close()
         cap.release()
@@ -563,6 +768,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w-body", type=float, default=0.3, help="融合時の体埋め込み重み")
     p.add_argument("--local-show", action="store_true", help="ローカルテスト時にimshowを強制表示")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="推論デバイスの指定")
+    p.add_argument("--tracker", choices=["embed", "bytetrack", "strongsort"], default="embed", help="トラッカーの選択")
+    p.add_argument("--log-every-sec", type=float, default=5.0, help="進捗ログ出力の周期(秒)")
+    p.add_argument("--checkpoint-every-sec", type=float, default=60.0, help="CSVフラッシュ/履歴追記の周期(秒)")
+    p.add_argument("--merge-every-sec", type=float, default=60.0, help="軽量マージスナップショットの周期(秒, 0で無効)")
+    p.add_argument("--run-id", default=None, help="出力run名に付与する任意ID")
     return p.parse_args()
 
 
@@ -596,6 +806,11 @@ def main() -> None:
         w_face=args.w_face,
         w_body=args.w_body,
         device=args.device,
+        tracker_backend=args.tracker,
+        log_every_sec=args.log_every_sec,
+        checkpoint_every_sec=args.checkpoint_every_sec,
+        merge_every_sec=args.merge_every_sec,
+        run_id=args.run_id,
     )
 
 
