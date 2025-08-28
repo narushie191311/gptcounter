@@ -451,6 +451,7 @@ def analyze_video(
     log_every_sec: float = 5.0,
     checkpoint_every_sec: float = 60.0,
     merge_every_sec: float = 60.0,
+    flush_every_n: int = 5,
     run_id: Optional[str] = None,
 ) -> None:
     face_app = init_face_app(det_w=int(det_size[0]), det_h=int(det_size[1]), device=device)
@@ -527,6 +528,14 @@ def analyze_video(
         remaining_duration = total_video_duration - start_sec if total_video_duration > start_sec else 0
         print(f"[INFO] 解析範囲: {start_sec}秒目から動画の最後まで（残り約{remaining_duration:.0f}秒）", flush=True)
     print(f"[INFO] ログ出力: {log_every_sec}秒毎、チェックポイント: {checkpoint_every_sec}秒毎", flush=True)
+    
+    # CUDA使用状況の確認
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "Unknown"
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.device_count() > 0 else 0
+        print(f"[INFO] CUDA使用中: {gpu_name} ({gpu_memory:.1f}GB)", flush=True)
+    else:
+        print(f"[INFO] CUDA使用不可: CPU処理", flush=True)
 
     def write_progress(now_wall: float) -> None:
         fps_val = (cap.get(cv2.CAP_PROP_FPS) or 30.0)
@@ -837,6 +846,15 @@ def analyze_video(
                     tr.age if tr.age is not None else "", tr.gender if tr.gender is not None else "",
                     x, y, w, h, f"{conf_val:.3f}", emb_b64, abs_ts
                 ])
+            
+            # フレーム処理後にCSVをフラッシュ（データ損失防止）
+            # パフォーマンス向上のため、フレーム毎ではなく適度な間隔でフラッシュ
+            if frame_idx % flush_every_n == 0:  # 設定された間隔でフラッシュ
+                csv_file.flush()
+                try:
+                    os.fsync(csv_file.fileno())  # ディスクに確実に書き込み
+                except Exception:
+                    pass
 
             if show_window:
                 relative_sec = current_time_sec - start_sec
@@ -905,8 +923,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="推論デバイスの指定")
     p.add_argument("--tracker", choices=["embed", "bytetrack", "strongsort"], default="embed", help="トラッカーの選択")
     p.add_argument("--log-every-sec", type=float, default=5.0, help="進捗ログ出力の周期(秒)")
-    p.add_argument("--checkpoint-every-sec", type=float, default=60.0, help="CSVフラッシュ/履歴追記の周期(秒)")
+    p.add_argument("--checkpoint-every-sec", type=float, default=30.0, help="CSVフラッシュ/履歴追記の周期(秒)")
     p.add_argument("--merge-every-sec", type=float, default=60.0, help="軽量マージスナップショットの周期(秒, 0で無効)")
+    p.add_argument("--flush-every-n", type=int, default=1, help="CSVフラッシュの間隔（フレーム数、1で毎フレーム）")
     p.add_argument("--run-id", default=None, help="出力run名に付与する任意ID")
     return p.parse_args()
 
@@ -945,6 +964,7 @@ def main() -> None:
         log_every_sec=args.log_every_sec,
         checkpoint_every_sec=args.checkpoint_every_sec,
         merge_every_sec=args.merge_every_sec,
+        flush_every_n=args.flush_every_n,
         run_id=args.run_id,
     )
 
