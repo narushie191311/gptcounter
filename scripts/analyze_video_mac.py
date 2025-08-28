@@ -473,6 +473,8 @@ def analyze_video(
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    # 動画の全体長を計算（秒）
+    total_video_duration = total_frames / fps if total_frames > 0 and fps > 0 else 0
 
     # シーク（時間単位で試して、失敗したらフレーム単位）
     cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
@@ -522,7 +524,8 @@ def analyze_video(
     if duration_sec and duration_sec > 0:
         print(f"[INFO] 解析範囲: {start_sec}秒目から {duration_sec}秒間", flush=True)
     else:
-        print(f"[INFO] 解析範囲: {start_sec}秒目から動画の最後まで", flush=True)
+        remaining_duration = total_video_duration - start_sec if total_video_duration > start_sec else 0
+        print(f"[INFO] 解析範囲: {start_sec}秒目から動画の最後まで（残り約{remaining_duration:.0f}秒）", flush=True)
     print(f"[INFO] ログ出力: {log_every_sec}秒毎、チェックポイント: {checkpoint_every_sec}秒毎", flush=True)
 
     def write_progress(now_wall: float) -> None:
@@ -530,14 +533,21 @@ def analyze_video(
         # 動画内の現在位置（start_secからの相対）
         current_video_sec = (frame_idx / fps_val)
         relative_time_sec = current_video_sec - start_sec
-        # 進捗率: duration指定があればその範囲, 無ければフレーム比で全体進捗
+        # 進捗率: duration指定があればその範囲, 無ければ動画全体の残り時間で計算
         if duration_sec and duration_sec > 0:
             processed_sec = max(0.0, min(duration_sec, relative_time_sec))
             percent = float(processed_sec / duration_sec) if duration_sec > 0 else 0.0
         else:
-            processed_sec = max(0.0, relative_time_sec)
-            denom_frames = max(1, total_frames - start_frame_pos)
-            percent = float(max(0, frame_idx - start_frame_pos) / denom_frames)
+            # 動画全体の残り時間で進捗率を計算
+            remaining_total = total_video_duration - start_sec
+            if remaining_total > 0:
+                processed_sec = max(0.0, min(remaining_total, relative_time_sec))
+                percent = float(processed_sec / remaining_total) if remaining_total > 0 else 0.0
+            else:
+                # フォールバック: フレーム数ベース
+                processed_sec = max(0.0, relative_time_sec)
+                denom_frames = max(1, total_frames - start_frame_pos)
+                percent = float(max(0, frame_idx - start_frame_pos) / denom_frames)
         elapsed = now_wall - start_wall
         eta_sec = (elapsed / percent - elapsed) if percent > 1e-6 else None
         # 現在時刻・ETA をJSTで
@@ -582,7 +592,17 @@ def analyze_video(
         female_count = prog['gender_count'].get('Female', 0)
         male_avg_age = prog['gender_age_mean'].get('Male', 0.0)
         female_avg_age = prog['gender_age_mean'].get('Female', 0.0)
-        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M:{male_count}(avg:{male_avg_age:.1f}) F:{female_count}(avg:{female_avg_age:.1f}) | elapsed={elapsed:.1f}s", flush=True)
+        # ETAと残り時間の表示
+        eta_info = ""
+        if eta_sec is not None and eta_sec > 0:
+            eta_hours = int(eta_sec // 3600)
+            eta_minutes = int((eta_sec % 3600) // 60)
+            if eta_hours > 0:
+                eta_info = f" | ETA: {eta_hours}h{eta_minutes}m"
+            else:
+                eta_info = f" | ETA: {eta_minutes}m"
+        
+        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M:{male_count}(avg:{male_avg_age:.1f}) F:{female_count}(avg:{female_avg_age:.1f}) | elapsed={elapsed:.1f}s{eta_info}", flush=True)
 
     def checkpoint(now_wall: float) -> None:
         # フラッシュして耐中断性を高める
