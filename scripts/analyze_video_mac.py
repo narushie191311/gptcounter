@@ -14,7 +14,12 @@ import torch
 from ultralytics import YOLO
 import json
 import threading
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+import re
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None  # フォールバック用
 try:
     import supervision as sv  # ByteTrack
 except Exception:
@@ -30,6 +35,34 @@ import base64
 
 INSIGHTFACE_ROOT = os.path.join(os.path.dirname(__file__), "..", "models_insightface")
 os.makedirs(INSIGHTFACE_ROOT, exist_ok=True)
+
+
+# 動画ファイル名から開始日時(YYYYMMDD_HHMM[-HHMM]...)を抽出（JST想定）
+FILENAME_PATTERNS = [
+    re.compile(r".*?(\d{8})_(\d{4})-(\d{4})\.[^.]+$"),  # ...YYYYMMDD_HHMM-HHMM.ext
+    re.compile(r".*?(\d{8})_(\d{4})\.[^.]+$"),           # ...YYYYMMDD_HHMM.ext
+]
+
+
+def parse_video_start_datetime(video_path: str) -> Optional[datetime]:
+    name = os.path.basename(video_path)
+    for pat in FILENAME_PATTERNS:
+        m = pat.match(name)
+        if m:
+            ymd = m.group(1)
+            hhmm = m.group(2)
+            dt = datetime.strptime(ymd + hhmm, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+            # 入力はJST想定なので、TZをJSTに合わせたい場合は以下を使用
+            try:
+                jst = ZoneInfo("Asia/Tokyo") if ZoneInfo else None
+            except Exception:
+                jst = None
+            if jst:
+                # 一旦naiveで作ってJST付与
+                dt_naive = datetime.strptime(ymd + hhmm, "%Y%m%d%H%M")
+                return dt_naive.replace(tzinfo=jst)
+            return dt  # フォールバック（UTC）
+    return None
 
 
 def init_face_app(det_w: int = 640, det_h: int = 640, device: str = "auto") -> FaceAnalysis:
@@ -461,6 +494,8 @@ def analyze_video(
     writer = csv.writer(csv_file)
     writer.writerow(["timestamp", "frame", "person_id", "track_id", "age", "gender", "x", "y", "w", "h", "conf", "embedding_b64"])
 
+    # 絶対開始時刻（JST）をファイル名から推定
+    video_dt = parse_video_start_datetime(video_path)
     start_time_video = start_sec
     end_time_video = start_sec + duration_sec
     frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
@@ -480,17 +515,29 @@ def analyze_video(
     next_merge_wall = start_wall + float(merge_every_sec) if merge_every_sec and merge_every_sec > 0 else float("inf")
 
     def write_progress(now_wall: float) -> None:
-        processed_sec = max(0.0, min(duration_sec, (frame_idx / (cap.get(cv2.CAP_PROP_FPS) or 30.0)) - start_sec))
+        fps_val = (cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        processed_sec = max(0.0, min(duration_sec, (frame_idx / fps_val) - start_sec))
         percent = float(processed_sec / duration_sec) if duration_sec > 0 else 0.0
         elapsed = now_wall - start_wall
         eta_sec = (elapsed / percent - elapsed) if percent > 1e-6 else None
-        eta_ts = (datetime.now() if eta_sec is None else datetime.fromtimestamp(now_wall + eta_sec)).strftime("%Y-%m-%d %H:%M:%S")
+        # 現在時刻・ETA をJSTで
+        now_utc = datetime.now(timezone.utc)
+        now_jst_dt = now_utc.astimezone(ZoneInfo("Asia/Tokyo")) if ZoneInfo else now_utc
+        eta_dt = (now_utc if eta_sec is None else datetime.fromtimestamp(now_wall + eta_sec, tz=timezone.utc))
+        eta_jst_dt = eta_dt.astimezone(ZoneInfo("Asia/Tokyo")) if ZoneInfo else eta_dt
+        now_jst = now_jst_dt.strftime("%Y-%m-%d %H:%M:%S")
+        eta_jst = eta_jst_dt.strftime("%Y-%m-%d %H:%M:%S")
+        # 動画内の現在位置（相対）
+        current_video_sec = start_sec + processed_sec
+        video_ts = format_timestamp(current_video_sec)
         prog = {
-            "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+            "now_jst": now_jst,
             "processed_sec": round(processed_sec, 3),
             "percent": round(min(1.0, percent) * 100.0, 2),
-            "eta": eta_ts,
-            "fps": round(cap.get(cv2.CAP_PROP_FPS) or 30.0, 2),
+            "eta_jst": eta_jst,
+            "fps": round(fps_val, 2),
+            "video_ts": video_ts,
             "gender_count": stats.gender_to_count,
             "gender_age_mean": {k: round(v, 2) for k, v in stats.means().items()},
             "online_unique_persons": len(set([tr.person_id for tr in tracker.tracks.values() if tr.person_id is not None])),
@@ -500,8 +547,8 @@ def analyze_video(
                 json.dump(prog, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
-        # 簡易ログ出力
-        print(f"[PROGRESS] {prog['percent']}% | persons={prog['online_unique_persons']} | M={prog['gender_count'].get('Male',0)} F={prog['gender_count'].get('Female',0)} ETA={prog['eta']}")
+        # 簡易ログ出力（JSTタイムスタンプ付き）
+        print(f"[{now_jst}] [PROGRESS] {prog['percent']}% | persons={prog['online_unique_persons']} | M={prog['gender_count'].get('Male',0)} F={prog['gender_count'].get('Female',0)} | video={video_ts} | ETA(JST)={eta_jst}")
 
     def checkpoint(now_wall: float) -> None:
         # フラッシュして耐中断性を高める
@@ -686,7 +733,18 @@ def analyze_video(
                     label += f" | {tr.gender}, {tr.age}"
                 cv2.putText(frame, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
+                # 動画内の相対ts
                 ts_str = format_timestamp(current_time_sec)
+                # 絶対時刻（JST）を列に追加（任意可）
+                abs_ts = ""
+                if video_dt is not None:
+                    # current_time_sec は動画全体の位置。開始位置start_secを考慮
+                    rel = current_time_sec
+                    try:
+                        abs_dt = (video_dt + timedelta(seconds=float(rel)))
+                        abs_ts = abs_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    except Exception:
+                        abs_ts = ""
                 conf_val = confidences[i] if i < len(confidences) else 1.0
                 emb_b64 = ""
                 emb_src = tr.embedding
@@ -704,10 +762,13 @@ def analyze_video(
                         emb_b64 = base64.b64encode(np.asarray(emb_src, dtype=np.float32).tobytes()).decode("ascii")
                     except Exception:
                         emb_b64 = ""
+                ts_out = abs_ts if abs_ts else ts_str
                 writer.writerow([
-                    ts_str, frame_idx, tr.person_id if tr.person_id is not None else tr.track_id, tr.track_id,
+                    ts_out, frame_idx, tr.person_id if tr.person_id is not None else tr.track_id, tr.track_id,
                     tr.age if tr.age is not None else "", tr.gender if tr.gender is not None else "",
                     x, y, w, h, f"{conf_val:.3f}", emb_b64,
+                    # 互換性のため末尾に絶対時刻を追加（読み手側は存在チェック）
+                    # 既存ヘッダを壊したくないので列名は据え置き（下位互換）
                 ])
 
             if show_window:
