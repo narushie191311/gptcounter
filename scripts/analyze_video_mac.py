@@ -493,7 +493,7 @@ def analyze_video(
     _ensure_dir(run_dir)
     csv_file = open(output_csv, "w", newline="")
     writer = csv.writer(csv_file)
-    writer.writerow(["timestamp", "frame", "person_id", "track_id", "age", "gender", "x", "y", "w", "h", "conf", "embedding_b64"])
+    writer.writerow(["timestamp", "frame", "person_id", "track_id", "age", "gender", "x", "y", "w", "h", "conf", "embedding_b64", "absolute_timestamp"])
 
     # 絶対開始時刻（JST）をファイル名から推定
     video_dt = parse_video_start_datetime(video_path)
@@ -519,10 +519,10 @@ def analyze_video(
         fps_val = (cap.get(cv2.CAP_PROP_FPS) or 30.0)
         # 進捗率: duration指定があればその範囲, 無ければフレーム比で全体進捗
         if duration_sec and duration_sec > 0:
-            processed_sec = max(0.0, min(duration_sec, (frame_idx / fps_val) - start_sec))
+            processed_sec = max(0.0, min(duration_sec, relative_time_sec))
             percent = float(processed_sec / duration_sec) if duration_sec > 0 else 0.0
         else:
-            processed_sec = max(0.0, (frame_idx - start_frame_pos) / fps_val)
+            processed_sec = max(0.0, relative_time_sec)
             denom_frames = max(1, total_frames - start_frame_pos)
             percent = float(max(0, frame_idx - start_frame_pos) / denom_frames)
         elapsed = now_wall - start_wall
@@ -534,9 +534,10 @@ def analyze_video(
         eta_jst_dt = eta_dt.astimezone(ZoneInfo("Asia/Tokyo")) if ZoneInfo else eta_dt
         now_jst = now_jst_dt.strftime("%Y-%m-%d %H:%M:%S")
         eta_jst = eta_jst_dt.strftime("%Y-%m-%d %H:%M:%S")
-        # 動画内の現在位置（相対）
+        # 動画内の現在位置（start_secからの相対）
         current_video_sec = (frame_idx / fps_val)
-        video_ts = format_timestamp(current_video_sec)
+        relative_video_sec = current_video_sec - start_sec
+        video_ts = format_timestamp(relative_video_sec)
         prog = {
             "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
             "now_jst": now_jst,
@@ -556,7 +557,7 @@ def analyze_video(
             pass
         # 簡易ログ出力（動画内タイムスタンプ・マージ後人数のみ）
         merged = prog['online_unique_persons']
-        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M={prog['gender_count'].get('Male',0)} F={prog['gender_count'].get('Female',0)}")
+        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M={prog['gender_count'].get('Male',0)} F={prog['gender_count'].get('Female',0)} | elapsed={elapsed:.1f}s")
 
     def checkpoint(now_wall: float) -> None:
         # フラッシュして耐中断性を高める
@@ -607,10 +608,12 @@ def analyze_video(
             frame_idx += 1
 
             current_time_sec = frame_idx / fps
-            if current_time_sec < start_time_video - 0.5:
+            # start_secからの相対時間を計算
+            relative_time_sec = current_time_sec - start_sec
+            if relative_time_sec < -0.5:  # start_secより少し前まで許容
                 continue
             if duration_sec and duration_sec > 0:
-                if current_time_sec > end_time_video:
+                if relative_time_sec > duration_sec:
                     break
             else:
                 # duration未指定の場合は動画末尾まで
@@ -746,8 +749,9 @@ def analyze_video(
                     label += f" | {tr.gender}, {tr.age}"
                 cv2.putText(frame, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
-                # 動画内の相対ts
-                ts_str = format_timestamp(current_time_sec)
+                # 動画内の相対ts（start_secからの相対位置）
+                relative_sec = current_time_sec - start_sec
+                ts_str = format_timestamp(relative_sec)
                 # 絶対時刻（JST）を列に追加（任意可）
                 abs_ts = ""
                 if video_dt is not None:
@@ -777,15 +781,14 @@ def analyze_video(
                         emb_b64 = ""
                 ts_out = abs_ts if abs_ts else ts_str
                 writer.writerow([
-                    ts_out, frame_idx, tr.person_id if tr.person_id is not None else tr.track_id, tr.track_id,
+                    ts_str, frame_idx, tr.person_id if tr.person_id is not None else tr.track_id, tr.track_id,
                     tr.age if tr.age is not None else "", tr.gender if tr.gender is not None else "",
-                    x, y, w, h, f"{conf_val:.3f}", emb_b64,
-                    # 互換性のため末尾に絶対時刻を追加（読み手側は存在チェック）
-                    # 既存ヘッダを壊したくないので列名は据え置き（下位互換）
+                    x, y, w, h, f"{conf_val:.3f}", emb_b64, abs_ts
                 ])
 
             if show_window:
-                info = f"t={format_timestamp(current_time_sec)}  fps={fps:.1f}  tracks={len(tracks)}"
+                relative_sec = current_time_sec - start_sec
+                info = f"t={format_timestamp(relative_sec)}  fps={fps:.1f}  tracks={len(tracks)}"
                 cv2.putText(frame, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
                 cv2.imshow("preview", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -826,7 +829,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Mac向け: 顔検出/年齢/性別/ID 付与・CSV出力")
     p.add_argument("--video", required=True, help="入力動画のパス")
     p.add_argument("--start-sec", type=float, default=1800.0, help="開始秒(例: 1800=30分)")
-    p.add_argument("--duration-sec", type=float, default=60.0, help="解析する秒数")
+    p.add_argument("--duration-sec", type=float, default=3600.0, help="解析する秒数（デフォルト: 1時間）")
     p.add_argument("--output-csv", default=os.path.join("outputs", "analysis.csv"))
     p.add_argument("--no-show", action="store_true", help="ウィンドウ表示を無効化")
     p.add_argument("--detect-every-n", type=int, default=5, help="Nフレーム毎に検出")

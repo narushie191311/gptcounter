@@ -36,7 +36,7 @@ pip install -r requirements.txt
 3) CLIで実行する場合:
 ```bash
 pip install -r requirements_colab.txt
-python scripts/analyze_video_mac.py --video /content/xxx.mkv --start-sec 1800 --duration-sec 60 \
+python scripts/analyze_video_mac.py --video /content/xxx.mkv --start-sec 1800 --duration-sec 3600 \
   --output-csv outputs/analysis.csv --video-out outputs/analysis.mp4 --save-video --no-show \
   --device cuda --det-size 1024x1024 --reid-cos 0.6 --gate-iou 0.25 --gate-sim 0.45
 python scripts/person_summary.py --input-csv outputs/analysis.csv --video /content/xxx.mkv \
