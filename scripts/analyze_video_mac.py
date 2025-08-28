@@ -514,9 +514,18 @@ def analyze_video(
     next_log_wall = start_wall + float(log_every_sec)
     next_ckpt_wall = start_wall + float(checkpoint_every_sec)
     next_merge_wall = start_wall + float(merge_every_sec) if merge_every_sec and merge_every_sec > 0 else float("inf")
+    
+    # 開始時のログ出力
+    if video_dt is not None:
+        start_time_str = video_dt.strftime("%H:%M:%S")
+        print(f"[INFO] 解析開始: 動画時刻 {start_time_str} から開始します", flush=True)
+    print(f"[INFO] 解析範囲: {start_sec}秒目から {duration_sec}秒間", flush=True)
 
     def write_progress(now_wall: float) -> None:
         fps_val = (cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        # 動画内の現在位置（start_secからの相対）
+        current_video_sec = (frame_idx / fps_val)
+        relative_time_sec = current_video_sec - start_sec
         # 進捗率: duration指定があればその範囲, 無ければフレーム比で全体進捗
         if duration_sec and duration_sec > 0:
             processed_sec = max(0.0, min(duration_sec, relative_time_sec))
@@ -537,7 +546,15 @@ def analyze_video(
         # 動画内の現在位置（start_secからの相対）
         current_video_sec = (frame_idx / fps_val)
         relative_video_sec = current_video_sec - start_sec
-        video_ts = format_timestamp(relative_video_sec)
+        # 絶対時刻（JST）を表示（11:41からの経過時間）
+        if video_dt is not None:
+            try:
+                abs_dt = (video_dt + timedelta(seconds=float(current_video_sec)))
+                video_ts = abs_dt.strftime("%H:%M:%S")
+            except Exception:
+                video_ts = format_timestamp(relative_video_sec)
+        else:
+            video_ts = format_timestamp(relative_video_sec)
         prog = {
             "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
             "now_jst": now_jst,
@@ -557,7 +574,7 @@ def analyze_video(
             pass
         # 簡易ログ出力（動画内タイムスタンプ・マージ後人数のみ）
         merged = prog['online_unique_persons']
-        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M={prog['gender_count'].get('Male',0)} F={prog['gender_count'].get('Female',0)} | elapsed={elapsed:.1f}s")
+        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M={prog['gender_count'].get('Male',0)} F={prog['gender_count'].get('Female',0)} | elapsed={elapsed:.1f}s", flush=True)
 
     def checkpoint(now_wall: float) -> None:
         # フラッシュして耐中断性を高める
