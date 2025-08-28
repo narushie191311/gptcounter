@@ -925,7 +925,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every-sec", type=float, default=5.0, help="進捗ログ出力の周期(秒)")
     p.add_argument("--checkpoint-every-sec", type=float, default=30.0, help="CSVフラッシュ/履歴追記の周期(秒)")
     p.add_argument("--merge-every-sec", type=float, default=60.0, help="軽量マージスナップショットの周期(秒, 0で無効)")
-    p.add_argument("--flush-every-n", type=int, default=1, help="CSVフラッシュの間隔（フレーム数、1で毎フレーム）")
+    p.add_argument("--flush-every-n", type=int, default=30, help="CSVフラッシュの間隔（フレーム数、30で30フレーム毎）")
     p.add_argument("--run-id", default=None, help="出力run名に付与する任意ID")
     return p.parse_args()
 
