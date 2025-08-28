@@ -520,6 +520,7 @@ def analyze_video(
         start_time_str = video_dt.strftime("%H:%M:%S")
         print(f"[INFO] 解析開始: 動画時刻 {start_time_str} から開始します", flush=True)
     print(f"[INFO] 解析範囲: {start_sec}秒目から {duration_sec}秒間", flush=True)
+    print(f"[INFO] ログ出力: {log_every_sec}秒毎、チェックポイント: {checkpoint_every_sec}秒毎", flush=True)
 
     def write_progress(now_wall: float) -> None:
         fps_val = (cap.get(cv2.CAP_PROP_FPS) or 30.0)
@@ -572,9 +573,13 @@ def analyze_video(
                 json.dump(prog, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
-        # 簡易ログ出力（動画内タイムスタンプ・マージ後人数のみ）
+        # 簡易ログ出力（動画内タイムスタンプ・マージ後人数・男女別統計）
         merged = prog['online_unique_persons']
-        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M={prog['gender_count'].get('Male',0)} F={prog['gender_count'].get('Female',0)} | elapsed={elapsed:.1f}s", flush=True)
+        male_count = prog['gender_count'].get('Male', 0)
+        female_count = prog['gender_count'].get('Female', 0)
+        male_avg_age = prog['gender_age_mean'].get('Male', 0.0)
+        female_avg_age = prog['gender_age_mean'].get('Female', 0.0)
+        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M:{male_count}(avg:{male_avg_age:.1f}) F:{female_count}(avg:{female_avg_age:.1f}) | elapsed={elapsed:.1f}s", flush=True)
 
     def checkpoint(now_wall: float) -> None:
         # フラッシュして耐中断性を高める
@@ -827,6 +832,12 @@ def analyze_video(
             if now_wall >= next_log_wall:
                 write_progress(now_wall)
                 next_log_wall = now_wall + float(log_every_sec)
+                # ログ出力後、統計を即座に表示
+                male_count = stats.gender_to_count.get('Male', 0)
+                female_count = stats.gender_to_count.get('Female', 0)
+                male_avg_age = (stats.gender_to_age_sum.get('Male', 0.0) / stats.gender_to_age_n.get('Male', 1)) if stats.gender_to_age_n.get('Male', 0) > 0 else 0.0
+                female_avg_age = (stats.gender_to_age_sum.get('Female', 0.0) / stats.gender_to_age_n.get('Female', 1)) if stats.gender_to_age_n.get('Female', 0) > 0 else 0.0
+                print(f"[STATS] M:{male_count}(avg:{male_avg_age:.1f}) F:{female_count}(avg:{female_avg_age:.1f})", flush=True)
             if now_wall >= next_ckpt_wall:
                 checkpoint(now_wall)
                 next_ckpt_wall = now_wall + float(checkpoint_every_sec)
