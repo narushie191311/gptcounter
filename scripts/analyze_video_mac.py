@@ -479,6 +479,7 @@ def analyze_video(
     # 一部のコーデックでは MSEC が効かないため冗長に設定
     target_frame = int(round(start_sec * fps))
     cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+    start_frame_pos = target_frame
 
     tracker = EmbeddingTracker(iou_gate=gate_iou, sim_gate=gate_sim, max_missed=int(fps * 2), reid=PersonRegistry(cosine_thresh=reid_cosine_thresh))
     # attribute memory for external trackers
@@ -516,8 +517,14 @@ def analyze_video(
 
     def write_progress(now_wall: float) -> None:
         fps_val = (cap.get(cv2.CAP_PROP_FPS) or 30.0)
-        processed_sec = max(0.0, min(duration_sec, (frame_idx / fps_val) - start_sec))
-        percent = float(processed_sec / duration_sec) if duration_sec > 0 else 0.0
+        # 進捗率: duration指定があればその範囲, 無ければフレーム比で全体進捗
+        if duration_sec and duration_sec > 0:
+            processed_sec = max(0.0, min(duration_sec, (frame_idx / fps_val) - start_sec))
+            percent = float(processed_sec / duration_sec) if duration_sec > 0 else 0.0
+        else:
+            processed_sec = max(0.0, (frame_idx - start_frame_pos) / fps_val)
+            denom_frames = max(1, total_frames - start_frame_pos)
+            percent = float(max(0, frame_idx - start_frame_pos) / denom_frames)
         elapsed = now_wall - start_wall
         eta_sec = (elapsed / percent - elapsed) if percent > 1e-6 else None
         # 現在時刻・ETA をJSTで
@@ -528,7 +535,7 @@ def analyze_video(
         now_jst = now_jst_dt.strftime("%Y-%m-%d %H:%M:%S")
         eta_jst = eta_jst_dt.strftime("%Y-%m-%d %H:%M:%S")
         # 動画内の現在位置（相対）
-        current_video_sec = start_sec + processed_sec
+        current_video_sec = (frame_idx / fps_val)
         video_ts = format_timestamp(current_video_sec)
         prog = {
             "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
@@ -547,8 +554,9 @@ def analyze_video(
                 json.dump(prog, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
-        # 簡易ログ出力（JSTタイムスタンプ付き）
-        print(f"[{now_jst}] [PROGRESS] {prog['percent']}% | persons={prog['online_unique_persons']} | M={prog['gender_count'].get('Male',0)} F={prog['gender_count'].get('Female',0)} | video={video_ts} | ETA(JST)={eta_jst}")
+        # 簡易ログ出力（動画内タイムスタンプ・マージ後人数のみ）
+        merged = prog['online_unique_persons']
+        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M={prog['gender_count'].get('Male',0)} F={prog['gender_count'].get('Female',0)}")
 
     def checkpoint(now_wall: float) -> None:
         # フラッシュして耐中断性を高める
@@ -601,8 +609,13 @@ def analyze_video(
             current_time_sec = frame_idx / fps
             if current_time_sec < start_time_video - 0.5:
                 continue
-            if current_time_sec > end_time_video:
-                break
+            if duration_sec and duration_sec > 0:
+                if current_time_sec > end_time_video:
+                    break
+            else:
+                # duration未指定の場合は動画末尾まで
+                if frame_idx >= total_frames - 1:
+                    break
 
             do_detect = (frame_idx - last_detect_frame) >= (1 if tracker_backend in ("bytetrack", "strongsort") else detect_every_n)
             boxes: List[Tuple[int, int, int, int]] = []
