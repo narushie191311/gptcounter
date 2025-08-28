@@ -519,7 +519,10 @@ def analyze_video(
     if video_dt is not None:
         start_time_str = video_dt.strftime("%H:%M:%S")
         print(f"[INFO] 解析開始: 動画時刻 {start_time_str} から開始します", flush=True)
-    print(f"[INFO] 解析範囲: {start_sec}秒目から {duration_sec}秒間", flush=True)
+    if duration_sec and duration_sec > 0:
+        print(f"[INFO] 解析範囲: {start_sec}秒目から {duration_sec}秒間", flush=True)
+    else:
+        print(f"[INFO] 解析範囲: {start_sec}秒目から動画の最後まで", flush=True)
     print(f"[INFO] ログ出力: {log_every_sec}秒毎、チェックポイント: {checkpoint_every_sec}秒毎", flush=True)
 
     def write_progress(now_wall: float) -> None:
@@ -593,8 +596,15 @@ def analyze_video(
             pass
         # 進捗履歴に1行追記
         try:
-            processed_sec = max(0.0, min(duration_sec, (frame_idx / (cap.get(cv2.CAP_PROP_FPS) or 30.0)) - start_sec))
-            percent = float(processed_sec / duration_sec) if duration_sec > 0 else 0.0
+            current_video_sec = (frame_idx / (cap.get(cv2.CAP_PROP_FPS) or 30.0))
+            relative_time_sec = current_video_sec - start_sec
+            if duration_sec and duration_sec > 0:
+                processed_sec = max(0.0, min(duration_sec, relative_time_sec))
+                percent = float(processed_sec / duration_sec) if duration_sec > 0 else 0.0
+            else:
+                processed_sec = max(0.0, relative_time_sec)
+                denom_frames = max(1, total_frames - start_frame_pos)
+                percent = float(max(0, frame_idx - start_frame_pos) / denom_frames)
             line = {
                 "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "processed_sec": round(processed_sec, 3),
@@ -857,7 +867,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Mac向け: 顔検出/年齢/性別/ID 付与・CSV出力")
     p.add_argument("--video", required=True, help="入力動画のパス")
     p.add_argument("--start-sec", type=float, default=1800.0, help="開始秒(例: 1800=30分)")
-    p.add_argument("--duration-sec", type=float, default=3600.0, help="解析する秒数（デフォルト: 1時間）")
+    p.add_argument("--duration-sec", type=float, default=0.0, help="解析する秒数（0または省略で動画の最後まで）")
     p.add_argument("--output-csv", default=os.path.join("outputs", "analysis.csv"))
     p.add_argument("--no-show", action="store_true", help="ウィンドウ表示を無効化")
     p.add_argument("--detect-every-n", type=int, default=5, help="Nフレーム毎に検出")
