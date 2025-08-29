@@ -80,8 +80,10 @@ def init_face_app(det_w: int = 640, det_h: int = 640, device: str = "auto", face
     # Colab(A100)ではCUDA、MacではCPU/MPSを使い分け
     requested_cuda = device.lower() in ("cuda", "gpu")
     cuda_available = torch.cuda.is_available()
+    # 強制CPU環境変数でGPUを避ける（TRT/ドライバ競合回避）
+    force_cpu = bool(os.environ.get("ORT_FORCE_CPU_FOR_FACE", "0") == "1")
     providers_try = []
-    if requested_cuda or (device.lower() == "auto" and cuda_available):
+    if not force_cpu and (requested_cuda or (device.lower() == "auto" and cuda_available)):
         providers_try.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
     providers_try.append(["CPUExecutionProvider"])  # フォールバック
 
@@ -94,7 +96,7 @@ def init_face_app(det_w: int = 640, det_h: int = 640, device: str = "auto", face
             return app
         except Exception as e:  # noqa: BLE001
             last_err = e
-    raise RuntimeError(f"FaceAnalysis初期化に失敗: {last_err}")
+    raise RuntimeError(f"FaceAnalysis初期化に失敗: {repr(last_err)} | providers_tried={providers_try}")
 
 
 def init_person_detector(device: str = "auto", trt_engine: Optional[str] = None, yolo_weights: str = "yolov8n.pt") -> YOLO:
@@ -322,7 +324,9 @@ def load_networks(paths: Dict[str, str]):
     return face_net, age_net, gender_net
 
 
-def detect_faces_and_attrs(face_app: FaceAnalysis, frame: np.ndarray, conf_threshold: float = 0.5):
+def detect_faces_and_attrs(face_app: Optional[FaceAnalysis], frame: np.ndarray, conf_threshold: float = 0.5):
+    if face_app is None:
+        return []
     faces = face_app.get(frame)
     results = []  # (box, score, age, gender_str, embedding)
     for f in faces:
