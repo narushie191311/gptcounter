@@ -667,9 +667,10 @@ def analyze_video(
     next_ckpt_wall = start_wall + float(checkpoint_every_sec)
     next_merge_wall = start_wall + float(merge_every_sec) if merge_every_sec and merge_every_sec > 0 else float("inf")
     # 自動調整: 目標ウォール時間（分）
-    target_wall_min = float(os.environ.get("TARGET_WALL_MIN", "0"))
+    target_wall_min = float(os.environ.get("TARGET_WALL_MIN", str(getattr(locals().get('args', object()), 'target_wall_min', 0))) or 0)
     # 起動後のウォームアップ区間（秒）
     autotune_warmup_sec = float(os.environ.get("AUTOTUNE_WARMUP_SEC", "30"))
+    autotune_interval_sec = float(os.environ.get("AUTOTUNE_INTERVAL_SEC", "30"))
     last_autotune_wall = start_wall
     # 現在の process_fps 推定
     current_process_fps = float(process_fps or 0.0)
@@ -1069,28 +1070,22 @@ def analyze_video(
                 threading.Thread(target=launch_merge_snapshot, daemon=True).start()
                 next_merge_wall = now_wall + float(merge_every_sec)
 
-            # オートチューニング: 目標時間に合わせて stride_frames を調整
-            if target_wall_min and target_wall_min > 0 and (now_wall - start_wall) > autotune_warmup_sec and (now_wall - last_autotune_wall) > max(autotune_warmup_sec, 20):
+            # オートチューニング: 目標時間に合わせて必要な stride を直接推定
+            if target_wall_min and target_wall_min > 0 and (now_wall - start_wall) > autotune_warmup_sec and (now_wall - last_autotune_wall) > autotune_interval_sec:
                 elapsed = now_wall - start_wall
                 processed_frames = max(1, frame_idx - start_frame_pos)
-                # 実測処理速度（frames/sec）
-                fps_proc = processed_frames / elapsed
+                fps_proc = processed_frames / elapsed  # 実測の処理フレーム/秒
                 remaining_frames = max(0, (total_frames - frame_idx))
-                eta_sec_frames = remaining_frames / max(fps_proc, 1e-6)
                 target_total_sec = float(target_wall_min) * 60.0
-                remaining_target = max(1.0, target_total_sec - elapsed)
-                # 目標に合わせるための必要間引率（単純比）
-                scale = eta_sec_frames / remaining_target
-                # scale > 1 なら間引きを強め、< 1 なら緩める
-                if scale > 1.05 or scale < 0.95:
-                    new_stride = stride_frames
-                    if scale > 1.05:
-                        new_stride = min(stride_frames * 2, int(fps))
-                    elif scale < 0.95 and stride_frames > 1:
-                        new_stride = max(1, stride_frames // 2)
-                    if new_stride != stride_frames:
-                        stride_frames = new_stride
-                        last_autotune_wall = now_wall
+                remaining_target = max(10.0, target_total_sec - elapsed)
+                # s_needed ≈ remaining_frames / (fps_proc * remaining_target)
+                import math
+                s_needed = int(math.ceil(remaining_frames / max(fps_proc * remaining_target, 1e-6)))
+                s_needed = max(1, min(s_needed, int(max(1.0, fps))))
+                if s_needed != stride_frames:
+                    print(f"[AUTOTUNE] stride {stride_frames} -> {s_needed} (fps_proc={fps_proc:.2f}, remaining_frames={remaining_frames}, remaining_target={remaining_target:.1f}s)", flush=True)
+                    stride_frames = s_needed
+                    last_autotune_wall = now_wall
             # 次の処理フレームへスキップ（高速化）
             if stride_frames > 1:
                 next_pos = frame_idx + (stride_frames - 1)
