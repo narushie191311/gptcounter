@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 究極性能並列処理スクリプト
-ETA制御付きの最高品質処理 + 中断再開対応
+ETA制御付きの最高品質処理
 """
 
 import os
@@ -10,11 +10,12 @@ import subprocess
 import multiprocessing as mp
 import json
 import time
-import signal
+import threading
 from pathlib import Path
 import argparse
 import psutil
-import pickle
+import GPUtil
+import signal
 
 class UltimateParallelProcessor:
     def __init__(self, video_path, num_chunks, config_name, eta_target=None, output_csv=None):
@@ -27,67 +28,134 @@ class UltimateParallelProcessor:
         self.chunk_results = []
         self.resume_file = "outputs/parallel_resume_state.json"
         
-        # 設定読み込み
-        with open("colab_ultimate_config.json", "r") as f:
-            self.configs = json.load(f)
-        
+        # 設定読み込み（複数パスから検索）
+        self.configs = self._load_config()
         self.config = self.configs[config_name]
         
         # 中断シグナルハンドラー
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
+    def _load_config(self):
+        """設定ファイルを複数パスから検索して読み込み"""
+        config_paths = [
+            "colab_ultimate_config.json",  # カレントディレクトリ
+            "scripts/colab_ultimate_config.json",  # scriptsディレクトリ
+            "../colab_ultimate_config.json",  # 親ディレクトリ
+            "/content/drive/MyDrive/gptcounter/colab_ultimate_config.json",  # Colab絶対パス
+            "/content/gptcounter/colab_ultimate_config.json",  # Colab標準パス
+        ]
+        
+        for config_path in config_paths:
+            try:
+                if os.path.exists(config_path):
+                    print(f"✓ 設定ファイルを発見: {config_path}")
+                    with open(config_path, "r") as f:
+                        return json.load(f)
+            except Exception as e:
+                print(f"⚠️ 設定ファイル読み込み失敗 {config_path}: {e}")
+                continue
+        
+        # 設定ファイルが見つからない場合のデフォルト設定
+        print("⚠️ 設定ファイルが見つかりません。デフォルト設定を使用します。")
+        return {
+            "ultimate": {
+                "det_size": "2048x2048",
+                "yolo_weights": "yolov8x.pt",
+                "reid_backend": "ensemble",
+                "face_model": "buffalo_l",
+                "gait_features": True,
+                "detect_every_n": 1,
+                "log_every_sec": 2,
+                "checkpoint_every_sec": 10,
+                "merge_every_sec": 30,
+                "flush_every_n": 5
+            },
+            "high_performance": {
+                "det_size": "1536x1536",
+                "yolo_weights": "yolov8x.pt",
+                "reid_backend": "ensemble",
+                "face_model": "buffalo_l",
+                "gait_features": True,
+                "detect_every_n": 1,
+                "log_every_sec": 5,
+                "checkpoint_every_sec": 15,
+                "merge_every_sec": 60,
+                "flush_every_n": 10
+            },
+            "balanced": {
+                "det_size": "1280x1280",
+                "yolo_weights": "yolov8m.pt",
+                "reid_backend": "ensemble",
+                "face_model": "buffalo_l",
+                "gait_features": True,
+                "detect_every_n": 1,
+                "log_every_sec": 10,
+                "checkpoint_every_sec": 30,
+                "merge_every_sec": 120,
+                "flush_every_n": 20
+            },
+            "fast": {
+                "det_size": "960x960",
+                "yolo_weights": "yolov8n.pt",
+                "reid_backend": "hist",
+                "face_model": "buffalo_l",
+                "gait_features": False,
+                "detect_every_n": 2,
+                "log_every_sec": 15,
+                "checkpoint_every_sec": 60,
+                "merge_every_sec": 300,
+                "flush_every_n": 50
+            }
+        }
+    
     def _signal_handler(self, signum, frame):
-        """中断シグナルハンドラー"""
-        print(f"\n⚠️ 中断シグナル {signum} を受信しました")
+        """シグナルハンドラー: 中断時に中断状態を保存"""
+        print(f"\nシグナル {signum} を受信しました。中断状態を保存します...")
         self._save_resume_state()
-        print("中断状態を保存しました。同じコマンドで再開できます。")
         sys.exit(0)
     
     def _save_resume_state(self):
-        """再開状態を保存"""
-        resume_state = {
+        """中断状態をJSONファイルに保存"""
+        resume_data = {
             "video_path": self.video_path,
             "num_chunks": self.num_chunks,
             "config_name": self.config_name,
             "eta_target": self.eta_target,
-            "output_csv": self.output_csv,
-            "chunk_results": self.chunk_results,
             "start_time": self.start_time,
-            "timestamp": time.time()
+            "chunk_results": self.chunk_results
         }
-        
-        Path("outputs").mkdir(exist_ok=True)
-        with open(self.resume_file, "w") as f:
-            json.dump(resume_state, f, indent=2)
+        try:
+            with open(self.resume_file, "w") as f:
+                json.dump(resume_data, f, indent=4)
+            print(f"中断状態を {self.resume_file} に保存しました。")
+        except Exception as e:
+            print(f"中断状態の保存に失敗しました: {e}")
     
     def _load_resume_state(self):
-        """再開状態を読み込み"""
+        """中断状態をJSONファイルから読み込み"""
         if os.path.exists(self.resume_file):
             try:
                 with open(self.resume_file, "r") as f:
-                    resume_state = json.load(f)
-                
-                print(f"🔄 再開状態を検出しました（{time.ctime(resume_state['timestamp'])}）")
-                
-                # 再開確認
-                response = input("中断された処理を再開しますか？ (y/N): ")
-                if response.lower() == 'y':
-                    self.chunk_results = resume_state.get("chunk_results", [])
-                    self.start_time = resume_state.get("start_time")
-                    print(f"✓ {len(self.chunk_results)} チャンクの状態を復元しました")
+                    resume_data = json.load(f)
+                    self.video_path = resume_data["video_path"]
+                    self.num_chunks = resume_data["num_chunks"]
+                    self.config_name = resume_data["config_name"]
+                    self.eta_target = resume_data["eta_target"]
+                    self.start_time = resume_data["start_time"]
+                    self.chunk_results = resume_data["chunk_results"]
+                    print(f"中断状態を {self.resume_file} から読み込みました。")
                     return True
-                else:
-                    print("新規実行を開始します")
-                    return False
-            except:
-                print("再開状態の読み込みに失敗しました。新規実行を開始します。")
-        
+            except Exception as e:
+                print(f"中断状態の読み込みに失敗しました: {e}")
         return False
     
-    def process_chunk(self, args):
-        """チャンク処理（pickle可能な関数）"""
+    def process_chunk_with_monitoring(self, args):
+        """監視付きチャンク処理"""
         chunk_id, start_sec, duration_sec = args
+        
+        # GPU使用率監視
+        gpu_monitor = GPUMonitor()
         
         output_csv = f"outputs/chunks/chunk_{chunk_id:03d}.csv"
         output_video = f"outputs/chunks/chunk_{chunk_id:03d}.mp4"
@@ -98,13 +166,29 @@ class UltimateParallelProcessor:
         
         try:
             # 処理開始
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
-            if result.returncode == 0:
+            # リアルタイム監視
+            while process.poll() is None:
+                gpu_stats = gpu_monitor.get_stats()
+                
+                # GPUメモリ不足時の対応
+                if gpu_stats["memory_used"] > gpu_stats["memory_total"] * 0.9:
+                    print(f"⚠️ チャンク {chunk_id}: GPUメモリ不足 - 処理を一時停止")
+                    process.terminate()
+                    time.sleep(5)
+                    # 軽量設定で再試行
+                    return self._retry_with_light_config(chunk_id, start_sec, duration_sec)
+                
+                time.sleep(2)
+            
+            if process.returncode == 0:
                 print(f"✓ チャンク {chunk_id} 完了")
+                with self.lock:
+                    self.chunk_results.append((True, chunk_id, output_csv))
                 return True, chunk_id, output_csv
             else:
-                print(f"✗ チャンク {chunk_id} 失敗: {result.stderr}")
+                print(f"✗ チャンク {chunk_id} 失敗")
                 return False, chunk_id, None
                 
         except Exception as e:
@@ -136,57 +220,94 @@ class UltimateParallelProcessor:
         
         return cmd
     
+    def _retry_with_light_config(self, chunk_id, start_sec, duration_sec):
+        """軽量設定で再試行"""
+        print(f"🔄 チャンク {chunk_id}: 軽量設定で再試行")
+        
+        light_config = {
+            "yolo_weights": "yolov8n.pt",
+            "det_size": "640x640",
+            "detect_every_n": 2,
+            "gait_features": False
+        }
+        
+        # 軽量設定でコマンド再構築
+        cmd = f'''python scripts/analyze_video_mac.py \\
+          --video "{self.video_path}" \\
+          --start-sec {start_sec} \\
+          --duration-sec {duration_sec} \\
+          --output-csv outputs/chunks/chunk_{chunk_id:03d}_light.csv \\
+          --device cuda \\
+          --yolo-weights {light_config['yolo_weights']} \\
+          --det-size {light_config['det_size']} \\
+          --detect-every-n {light_config['detect_every_n']} \\
+          --no-show'''
+        
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                print(f"✓ チャンク {chunk_id} 軽量設定で完了")
+                return True, chunk_id, f"outputs/chunks/chunk_{chunk_id:03d}_light.csv"
+            else:
+                return False, chunk_id, None
+        except:
+            return False, chunk_id, None
+    
     def execute_with_eta_control(self):
         """ETA制御付きで実行"""
-        # 再開状態チェック
-        resumed = self._load_resume_state()
+        self.start_time = time.time()
         
-        if not resumed:
-            self.start_time = time.time()
-        
-        # 動画情報取得
-        video_info = self._get_video_info()
-        if not video_info:
-            return False
-        
-        print(f"動画情報: {video_info['total_frames']} フレーム, {video_info['fps']:.2f} FPS, {video_info['total_duration']:.1f} 秒")
-        
-        # チャンク分割
-        chunks = self._create_chunks(video_info['total_duration'])
-        
-        # 既に完了したチャンクを除外
-        completed_chunk_ids = {result[1] for result in self.chunk_results}
-        remaining_chunks = [chunk for chunk in chunks if chunk[0] not in completed_chunk_ids]
-        
-        if remaining_chunks:
-            print(f"🔄 残り {len(remaining_chunks)} チャンクを処理します")
+        # 中断状態をロード
+        if self._load_resume_state():
+            print("中断状態から再開します...")
+            # チャンク分割を再計算
+            video_info = self._get_video_info()
+            if not video_info:
+                return False
+            
+            print(f"動画情報: {video_info['total_frames']} フレーム, {video_info['fps']:.2f} FPS, {video_info['total_duration']:.1f} 秒")
+            
+            chunks = self._create_chunks(video_info['total_duration'])
+            
+            # 中断時のチャンクから再開
+            resume_chunk_index = 0
+            for i, (_, _, _) in enumerate(chunks):
+                if (True, i, f"outputs/chunks/chunk_{i:03d}.csv") in self.chunk_results:
+                    resume_chunk_index = i
+                    break
+            
+            # 再開するチャンクのリストを作成
+            chunks_to_process = chunks[resume_chunk_index:]
+            print(f"再開するチャンク: {len(chunks_to_process)}/{len(chunks)}")
         else:
-            print("🎉 全てのチャンクが完了しています")
-        
-        # 出力ディレクトリ作成
-        Path("outputs/chunks").mkdir(parents=True, exist_ok=True)
+            # 通常の実行
+            video_info = self._get_video_info()
+            if not video_info:
+                return False
+            
+            print(f"動画情報: {video_info['total_frames']} フレーム, {video_info['fps']:.2f} FPS, {video_info['total_duration']:.1f} 秒")
+            
+            chunks = self._create_chunks(video_info['total_duration'])
+            
+            # 出力ディレクトリ作成
+            Path("outputs/chunks").mkdir(parents=True, exist_ok=True)
         
         # 並列処理実行
-        print(f"究極性能並列処理開始: {len(remaining_chunks)} チャンク")
+        print(f"究極性能並列処理開始: {self.num_chunks} チャンク")
         
-        if remaining_chunks:
-            with mp.Pool(processes=min(len(remaining_chunks), mp.cpu_count())) as pool:
-                results = pool.map(self.process_chunk, remaining_chunks)
-                
-                # 結果を既存の結果に追加
-                for result in results:
-                    if result[0]:  # 成功
-                        self.chunk_results.append(result)
-                        # 随時状態保存
-                        self._save_resume_state()
+        with mp.Pool(processes=min(self.num_chunks, mp.cpu_count())) as pool:
+            results = pool.map(self.process_chunk_with_monitoring, chunks_to_process)
         
         # 結果集計
-        successful_chunks = [result[2] for result in self.chunk_results if result[0]]
+        successful_chunks = []
+        for success, chunk_id, output_csv in results:
+            if success:
+                successful_chunks.append(output_csv)
         
         end_time = time.time()
-        processing_time = end_time - (self.start_time or end_time)
+        processing_time = end_time - self.start_time
         
-        print(f"\n🎉 並列処理完了: {len(successful_chunks)}/{self.num_chunks} チャンク成功")
+        print(f"\n🎉 並列処理完了: {len(successful_chunks)}/{len(chunks_to_process)} チャンク成功")
         print(f"処理時間: {processing_time:.1f} 秒")
         print(f"速度: {video_info['total_duration']/processing_time:.2f}x リアルタイム")
         
@@ -201,12 +322,7 @@ class UltimateParallelProcessor:
         if successful_chunks:
             self._merge_chunks(successful_chunks, self.output_csv)
         
-        # 完了後は再開ファイルを削除
-        if os.path.exists(self.resume_file):
-            os.remove(self.resume_file)
-            print("✓ 再開ファイルを削除しました")
-        
-        return len(successful_chunks) == self.num_chunks
+        return len(successful_chunks) == len(chunks_to_process)
     
     def _get_video_info(self):
         """動画情報を取得"""
@@ -257,6 +373,24 @@ class UltimateParallelProcessor:
         else:
             print("✗ マージするチャンクファイルが見つかりません")
 
+class GPUMonitor:
+    """GPU監視クラス"""
+    def get_stats(self):
+        try:
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu = gpus[0]  # 最初のGPU
+                return {
+                    "memory_used": gpu.memoryUsed,
+                    "memory_total": gpu.memoryTotal,
+                    "load": gpu.load,
+                    "temperature": gpu.temperature
+                }
+        except:
+            pass
+        
+        return {"memory_used": 0, "memory_total": 1, "load": 0, "temperature": 0}
+
 def main():
     parser = argparse.ArgumentParser(description="究極性能並列処理スクリプト")
     parser.add_argument("--video", required=True, help="動画ファイルパス")
@@ -265,17 +399,10 @@ def main():
                        choices=["ultimate", "high_performance", "balanced", "fast"],
                        help="設定プロファイル")
     parser.add_argument("--eta-target", type=float, help="目標処理時間（秒）")
-    parser.add_argument("--output-csv", help="出力CSVファイルパス")
     
     args = parser.parse_args()
     
-    processor = UltimateParallelProcessor(
-        args.video, 
-        args.chunks, 
-        args.config, 
-        args.eta_target,
-        args.output_csv
-    )
+    processor = UltimateParallelProcessor(args.video, args.chunks, args.config, args.eta_target)
     success = processor.execute_with_eta_control()
     
     sys.exit(0 if success else 1)
