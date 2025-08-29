@@ -488,7 +488,12 @@ def analyze_video(
     run_id: Optional[str] = None,
     process_fps: float = 0.0,
 ) -> None:
-    face_app = init_face_app(det_w=int(det_size[0]), det_h=int(det_size[1]), device=device)
+    # 現在の可変パラメータ（オートチューニング対象）
+    current_det_w, current_det_h = int(det_size[0]), int(det_size[1])
+    current_detect_every_n = int(detect_every_n)
+
+    # Face/YOLO 初期化
+    face_app = init_face_app(det_w=current_det_w, det_h=current_det_h, device=device)
     yolo = init_person_detector(device=device)
     # optional trackers
     bytetrack = None
@@ -674,6 +679,16 @@ def analyze_video(
     last_autotune_wall = start_wall
     # 現在の process_fps 推定
     current_process_fps = float(process_fps or 0.0)
+
+    # オートチューニングの品質制約（環境変数で調整可）
+    det_min = int(os.environ.get("AUTOTUNE_DET_MIN", "640"))
+    det_max = int(os.environ.get("AUTOTUNE_DET_MAX", "1024"))
+    det_step = int(os.environ.get("AUTOTUNE_DET_STEP", "64"))
+    det_pref = str(os.environ.get("AUTOTUNE_DET_PREF", "prefer_quality")).lower()  # prefer_quality / prefer_speed
+    d_n_min = int(os.environ.get("AUTOTUNE_DETECT_N_MIN", "1"))
+    d_n_max = int(os.environ.get("AUTOTUNE_DETECT_N_MAX", "4"))
+    # face_app 再準備用 ctx_id 推定
+    face_ctx_id = 0 if (device.lower() in ("cuda", "gpu") or (device.lower()=="auto" and torch.cuda.is_available())) else -1
     
     # 開始時のログ出力
     if video_dt is not None:
@@ -838,7 +853,7 @@ def analyze_video(
                 if frame_idx >= total_frames - 1:
                     break
 
-            effective_detect_every = 1 if tracker_backend in ("bytetrack", "strongsort") else detect_every_n
+            effective_detect_every = 1 if tracker_backend in ("bytetrack", "strongsort") else current_detect_every_n
             if stride_frames > 1 and effective_detect_every > 1:
                 effective_detect_every = max(1, int(round(effective_detect_every / stride_frames)))
             do_detect = (frame_idx - last_detect_frame) >= effective_detect_every
@@ -848,7 +863,7 @@ def analyze_video(
             if do_detect:
                 dets = detect_faces_and_attrs(face_app, frame, conf_threshold=conf_threshold)
                 # YOLOの入力解像度を顔検出サイズと揃える（短辺基準）
-                short_side = min(det_size[0], det_size[1]) if isinstance(det_size, tuple) else 640
+                short_side = min(current_det_w, current_det_h)
                 yolo_use_half = torch.cuda.is_available() and (device.lower() in ("auto", "cuda", "gpu"))
                 person_boxes = detect_person_boxes(yolo, frame, conf=body_conf, imgsz=short_side, use_half=yolo_use_half)
                 last_detect_frame = frame_idx
@@ -1086,6 +1101,38 @@ def analyze_video(
                     print(f"[AUTOTUNE] stride {stride_frames} -> {s_needed} (fps_proc={fps_proc:.2f}, remaining_frames={remaining_frames}, remaining_target={remaining_target:.1f}s)", flush=True)
                     stride_frames = s_needed
                     last_autotune_wall = now_wall
+
+                # ベース補正: できるだけ品質維持しつつ、det-size と detect-every-n を調整
+                det_changed = False
+                # 目標に対して遅れている（残り時間が足りない）場合は、速度寄りへ
+                if remaining_frames / max(fps_proc * s_needed, 1e-6) > remaining_target * 1.05:
+                    # まずは検出頻度を少し落とす（embed時のみ影響）
+                    if tracker_backend not in ("bytetrack", "strongsort") and current_detect_every_n < d_n_max:
+                        current_detect_every_n = min(d_n_max, current_detect_every_n + 1)
+                    # 次に det-size を段階的に下げる
+                    if current_det_w > det_min or current_det_h > det_min:
+                        new_w = max(det_min, current_det_w - det_step)
+                        new_h = max(det_min, current_det_h - det_step)
+                        if (new_w, new_h) != (current_det_w, current_det_h):
+                            current_det_w, current_det_h = new_w, new_h
+                            det_changed = True
+                else:
+                    # 余裕がある場合は品質寄りへ戻す
+                    if tracker_backend not in ("bytetrack", "strongsort") and current_detect_every_n > d_n_min:
+                        current_detect_every_n = max(d_n_min, current_detect_every_n - 1)
+                    if current_det_w < det_max or current_det_h < det_max:
+                        new_w = min(det_max, current_det_w + det_step)
+                        new_h = min(det_max, current_det_h + det_step)
+                        if (new_w, new_h) != (current_det_w, current_det_h):
+                            current_det_w, current_det_h = new_w, new_h
+                            det_changed = True
+
+                if det_changed:
+                    try:
+                        face_app.prepare(ctx_id=face_ctx_id, det_size=(current_det_w, current_det_h))
+                        print(f"[AUTOTUNE] det-size -> ({current_det_w},{current_det_h})", flush=True)
+                    except Exception:
+                        pass
             # 次の処理フレームへスキップ（高速化）
             if stride_frames > 1:
                 next_pos = frame_idx + (stride_frames - 1)
