@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List
+from typing import List, Optional, Tuple
 
 import cv2
 try:
@@ -19,8 +19,8 @@ def sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:100]
 
 
-def run_proc(cmd: List[str]) -> int:
-    p = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
+def run_proc(cmd: List[str], env: Optional[dict] = None) -> int:
+    p = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, env=env)
     return p.wait()
 
 
@@ -33,6 +33,11 @@ def main() -> None:
     ap.add_argument("--target-wall-min", type=float, default=0.0, help="target wall time minutes for auto shards")
     ap.add_argument("--warmup-sec", type=float, default=30.0, help="warmup seconds for auto shards")
     ap.add_argument("--mem-per-proc-gb", type=float, default=4.0, help="estimate VRAM per process for cap")
+    ap.add_argument("--chunk-sec", type=float, default=600.0, help="chunk duration seconds for dynamic scheduling")
+    ap.add_argument("--tail-chunk-sec", type=float, default=300.0, help="smaller chunk duration for the tail")
+    ap.add_argument("--gpus", default="", help="comma-separated GPU ids for multi-GPU (e.g., 0,1)")
+    ap.add_argument("--procs-per-gpu", type=int, default=1, help="parallel processes per GPU")
+    ap.add_argument("--skip-existing", type=int, default=1, help="skip chunks already written (1=yes,0=no)")
     ap.add_argument("--chunk-sec", type=float, default=600.0, help="chunk duration seconds for dynamic scheduling")
     args = ap.parse_args()
 
@@ -98,13 +103,23 @@ def main() -> None:
     shards = max(1, shards)
     per_sec = total_sec / shards if total_sec > 0 else 0
 
+    # GPU assignment (multi-GPU optional)
+    gpu_ids: List[str] = []
+    if args.gpus.strip():
+        gpu_ids = [g.strip() for g in args.gpus.split(",") if g.strip()]
+    max_workers = shards if not gpu_ids else min(shards, max(1, len(gpu_ids) * max(1, int(args.procs_per_gpu))))
+
     # 動的スケジューリング: チャンクのキューを作成
     chunk_sec = max(30.0, float(args.chunk_sec))
-    chunks = []  # (start_sec, duration_sec, out_path)
+    tail_chunk_sec = max(30.0, float(args.tail_chunk_sec))
+    chunks: List[Tuple[float, float, str]] = []  # (start_sec, duration_sec, out_path)
     cur = 0.0
     idx = 0
+    # 末尾20%は小さめのチャンク
+    tail_start = total_sec * 0.8 if total_sec > 0 else 0
     while cur < total_sec or (total_sec == 0 and idx == 0):
-        dur = chunk_sec if (total_sec <= 0 or cur + chunk_sec < total_sec) else max(0.0, total_sec - cur)
+        this_chunk = tail_chunk_sec if (total_sec > 0 and cur >= tail_start) else chunk_sec
+        dur = this_chunk if (total_sec <= 0 or cur + this_chunk < total_sec) else max(0.0, total_sec - cur)
         start_s = max(0.0, cur)
         # 最終チャンクは末尾まで（duration=0）
         if total_sec > 0 and cur + chunk_sec >= total_sec:
@@ -113,12 +128,89 @@ def main() -> None:
         chunks.append((start_s, dur, out_path))
         if dur == 0.0:
             break
-        cur += chunk_sec
+        cur += this_chunk
         idx += 1
 
-    print(f"[PARALLEL] workers={shards}, chunks={len(chunks)} (chunk_sec={int(chunk_sec)})")
+    print(f"[PARALLEL] workers={max_workers}, chunks={len(chunks)} (chunk_sec={int(chunk_sec)}/{int(tail_chunk_sec)})")
+
+    # 既存出力スキップ（互換: 旧shard名/新chunk名いずれも読み取り、カバー区間を算出）
+    def hhmmss_to_sec(s: str) -> Optional[float]:
+        try:
+            parts = s.strip().split(":")
+            if len(parts) != 3:
+                return None
+            h, m, s2 = int(parts[0]), int(parts[1]), float(parts[2])
+            return float(h) * 3600.0 + float(m) * 60.0 + s2
+        except Exception:
+            return None
+
+    def csv_range_seconds(path: str) -> Optional[Tuple[float, float]]:
+        try:
+            with open(path, newline="") as f:
+                header = f.readline().rstrip("\n")
+                cols = header.split(",")
+                try:
+                    idx_full = cols.index("ts_from_file_start")
+                except ValueError:
+                    try:
+                        idx_full = cols.index("timestamp")
+                    except ValueError:
+                        return None
+                first: Optional[float] = None
+                last: Optional[float] = None
+                for line in f:
+                    p = line.rstrip("\n").split(",")
+                    if len(p) <= idx_full:
+                        continue
+                    sec = hhmmss_to_sec(p[idx_full])
+                    if sec is None:
+                        continue
+                    if first is None:
+                        first = sec
+                    last = sec
+                if first is not None and last is not None:
+                    return (first, last)
+                return None
+        except Exception:
+            return None
+
+    covered: List[Tuple[float, float]] = []
+    if int(args.skip_existing) == 1:
+        # 旧shardファイル
+        for name in os.listdir(work_dir):
+            if not name.startswith(base_name + "_"):
+                continue
+            if not name.endswith(".csv"):
+                continue
+            rng = csv_range_seconds(os.path.join(work_dir, name))
+            if rng:
+                covered.append(rng)
+        # マージして簡略化
+        covered.sort()
+        merged: List[Tuple[float, float]] = []
+        for s, e in covered:
+            if not merged or s > merged[-1][1] + 1.0:
+                merged.append((s, e))
+            else:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        covered = merged
+
+        def is_fully_covered(s: float, e: float) -> bool:
+            for cs, ce in covered:
+                if s >= cs and e <= ce:
+                    return True
+            return False
+
+        # 既存に完全に含まれるチャンクを除外
+        filtered: List[Tuple[float, float, str]] = []
+        for s, d, op in chunks:
+            e = (total_sec if d == 0.0 and total_sec > 0 else (s + d))
+            if len(covered) > 0 and e is not None and is_fully_covered(s, e):
+                continue
+            filtered.append((s, d, op))
+        chunks = filtered
     rcodes = []
-    def make_cmd(start_s: float, dur_s: float, out_csv: str) -> List[str]:
+    def make_cmd(start_s: float, dur_s: float, out_csv: str, gpu_env: Optional[str]) -> Tuple[List[str], Optional[dict]]:
         cmd = [
             sys.executable,
             "scripts/analyze_video_mac.py",
@@ -131,13 +223,22 @@ def main() -> None:
         ]
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
-        return cmd
+        env = None
+        if gpu_env is not None:
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = gpu_env
+        return cmd, env
 
     # スレッドプールでワークキューを消化（速いワーカーが遅いチャンクを自動的に担当）
-    with ThreadPoolExecutor(max_workers=shards) as ex:
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = []
-        for (s, d, op) in chunks:
-            futs.append(ex.submit(run_proc, make_cmd(s, d, op)))
+        for i, (s, d, op) in enumerate(chunks):
+            # GPUをラウンドロビン割り当て
+            gpu_env = None
+            if gpu_ids:
+                gpu_env = gpu_ids[i % len(gpu_ids)]
+            cmd, env = make_cmd(s, d, op, gpu_env)
+            futs.append(ex.submit(run_proc, cmd, env))
         for fut in as_completed(futs):
             rcodes.append(fut.result())
     if any(r != 0 for r in rcodes):
