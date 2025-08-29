@@ -192,26 +192,33 @@ class UltimateParallelProcessor:
             # 追加の安定化フラグ（解析側でも参照）
             env.setdefault("DISABLE_TRT_EXPORT", "1")
             env.setdefault("ORT_FORCE_CPU_FOR_FACE", "1")
-            result = subprocess.run(
-                cmd, cwd=str(self.project_root), capture_output=True, text=True, env=env
-            )
+            # 子プロセスのログをそのまま親に流すかどうか（ENVで切替）
+            stream_logs = os.environ.get("STREAM_CHILD_LOGS", "0") == "1"
+            if stream_logs:
+                result = subprocess.run(cmd, cwd=str(self.project_root), env=env)
+            else:
+                result = subprocess.run(
+                    cmd, cwd=str(self.project_root), capture_output=True, text=True, env=env
+                )
             if result.returncode == 0:
                 print(f"✓ チャンク {chunk_id} 完了")
-                # ログ保存
-                try:
-                    (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.out").write_text(result.stdout or "")
-                    (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.err").write_text(result.stderr or "")
-                except Exception:
-                    pass
+                # ログ保存（ストリーミング時は保存しない）
+                if not stream_logs:
+                    try:
+                        (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.out").write_text(result.stdout or "")
+                        (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.err").write_text(result.stderr or "")
+                    except Exception:
+                        pass
                 return True, chunk_id, output_csv
             else:
                 print(f"✗ チャンク {chunk_id} 失敗 (code={result.returncode})")
-                # ログ保存
-                try:
-                    (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.out").write_text(result.stdout or "")
-                    (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.err").write_text(result.stderr or "")
-                except Exception:
-                    pass
+                # ログ保存（ストリーミング時は保存しない）
+                if not stream_logs:
+                    try:
+                        (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.out").write_text(result.stdout or "")
+                        (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.err").write_text(result.stderr or "")
+                    except Exception:
+                        pass
                 return False, chunk_id, None
         except Exception as e:
             print(f"✗ チャンク {chunk_id} エラー: {e}")
