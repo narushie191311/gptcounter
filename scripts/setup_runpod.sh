@@ -21,12 +21,17 @@ echo "=== Python環境 ==="
 python --version
 pip --version
 
-# 必要なパッケージのインストール確認
+# 必要なパッケージのインストール＆確認
+echo "=== パッケージインストール ==="
+pip install --no-cache-dir -r requirements.txt || true
+pip install --no-cache-dir -r requirements_colab.txt || true
+pip install --no-cache-dir annoy || true
 echo "=== パッケージ確認 ==="
 python -c "import torch; print(f'PyTorch: {torch.__version__}')"
 python -c "import torch; print(f'CUDA利用可能: {torch.cuda.is_available()}')"
 python -c "import cv2; print(f'OpenCV: {cv2.__version__}')"
 python -c "import numpy as np; print(f'NumPy: {np.__version__}')"
+python -c "import annoy; print(f'Annoy: {annoy.__version__}')" || echo "Annoy import failed"
 
 # モデルディレクトリの確認
 echo "=== モデルディレクトリ確認 ==="
