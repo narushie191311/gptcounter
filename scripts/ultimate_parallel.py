@@ -14,7 +14,10 @@ import threading
 from pathlib import Path
 import argparse
 import psutil
-import GPUtil
+try:
+    import GPUtil  # optional
+except Exception:  # pragma: no cover
+    GPUtil = None
 import signal
 
 class UltimateParallelProcessor:
@@ -30,6 +33,7 @@ class UltimateParallelProcessor:
         self.start_time = None
         self.chunk_results = []
         self.resume_file = str(Path(self.output_dir) / "parallel_resume_state.json")
+        self.lock = threading.Lock()
         
         # 設定読み込み（複数パスから検索）
         self.configs = self._load_config()
@@ -271,16 +275,9 @@ class UltimateParallelProcessor:
             print(f"動画情報: {video_info['total_frames']} フレーム, {video_info['fps']:.2f} FPS, {video_info['total_duration']:.1f} 秒")
             
             chunks = self._create_chunks(video_info['total_duration'])
-            
-            # 中断時のチャンクから再開
-            resume_chunk_index = 0
-            for i, (_, _, _) in enumerate(chunks):
-                if (True, i, f"outputs/chunks/chunk_{i:03d}.csv") in self.chunk_results:
-                    resume_chunk_index = i
-                    break
-            
-            # 再開するチャンクのリストを作成
-            chunks_to_process = chunks[resume_chunk_index:]
+            # 既に完了したチャンクを除外
+            completed_ids = {cid for ok, cid, _ in self.chunk_results if ok}
+            chunks_to_process = [c for c in chunks if c[0] not in completed_ids]
             print(f"再開するチャンク: {len(chunks_to_process)}/{len(chunks)}")
         else:
             # 通常の実行
@@ -291,12 +288,12 @@ class UltimateParallelProcessor:
             print(f"動画情報: {video_info['total_frames']} フレーム, {video_info['fps']:.2f} FPS, {video_info['total_duration']:.1f} 秒")
             
             chunks = self._create_chunks(video_info['total_duration'])
-            
+            chunks_to_process = chunks
             # 出力ディレクトリ作成
             Path(self.chunks_dir).mkdir(parents=True, exist_ok=True)
         
         # 並列処理実行
-        print(f"究極性能並列処理開始: {self.num_chunks} チャンク")
+        print(f"究極性能並列処理開始: {len(chunks_to_process)} チャンク")
         
         with mp.Pool(processes=min(self.num_chunks, mp.cpu_count())) as pool:
             results = pool.map(self.process_chunk_with_monitoring, chunks_to_process)
@@ -409,6 +406,8 @@ class GPUMonitor:
     """GPU監視クラス"""
     def get_stats(self):
         try:
+            if GPUtil is None:
+                raise RuntimeError("GPUtil not available")
             gpus = GPUtil.getGPUs()
             if gpus:
                 gpu = gpus[0]  # 最初のGPU
@@ -431,10 +430,19 @@ def main():
                        choices=["ultimate", "high_performance", "balanced", "fast"],
                        help="設定プロファイル")
     parser.add_argument("--eta-target", type=float, help="目標処理時間（秒）")
+    parser.add_argument("--output-dir", help="出力ベースディレクトリ（既定: outputs）")
+    parser.add_argument("--output-csv", help="マージ後の最終CSVファイルパス（既定: <output-dir>/ultimate_merged_analysis.csv）")
     
     args = parser.parse_args()
     
-    processor = UltimateParallelProcessor(args.video, args.chunks, args.config, args.eta_target)
+    processor = UltimateParallelProcessor(
+        args.video,
+        args.chunks,
+        args.config,
+        args.eta_target,
+        output_csv=args.output_csv,
+        output_dir=args.output_dir,
+    )
     success = processor.execute_with_eta_control()
     
     sys.exit(0 if success else 1)
