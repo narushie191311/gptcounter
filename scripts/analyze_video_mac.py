@@ -5,7 +5,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import cv2
 import numpy as np
@@ -93,14 +93,58 @@ def init_person_detector(device: str = "auto") -> YOLO:
     try:
         if use_cuda:
             model.to("cuda")
+            # FP16で高速化（A100推奨）
+            try:
+                if hasattr(model, "model"):
+                    model.model.half()
+            except Exception:
+                pass
+        # 推論最適化
+        try:
+            if hasattr(model, "fuse"):
+                model.fuse()
+        except Exception:
+            pass
     except Exception:
         pass
     return model
 
 
-def detect_person_boxes(yolo: YOLO, frame: np.ndarray, conf: float = 0.5) -> List[Tuple[Tuple[int, int, int, int], float]]:
+def configure_cuda_runtime() -> None:
+    # A100等での高速化設定
+    try:
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True  # 可変入力サイズ時に有効
+            # PyTorch 2.x の行列積精度（A100で高速化）
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def detect_person_boxes(
+    yolo: YOLO,
+    frame: np.ndarray,
+    conf: float = 0.5,
+    imgsz: Optional[int] = None,
+    use_half: bool = False,
+) -> List[Tuple[Tuple[int, int, int, int], float]]:
     # UltralyticsはRGB前提だがOpenCVはBGR。内部でハンドリングされるが、明示的に渡すだけでOK。
-    results = yolo.predict(source=frame, verbose=False, conf=conf, classes=[0])  # class 0: person
+    # imgsz と FP16 を指定して速度最適化（A100などGPUで有効）
+    predict_kwargs: Dict[str, Any] = {"source": frame, "verbose": False, "conf": conf, "classes": [0]}
+    if imgsz is not None:
+        predict_kwargs["imgsz"] = int(imgsz)
+    # half はv8.2+で有効。未対応版では無視するためtryに包む
+    if use_half:
+        predict_kwargs["half"] = True
+    try:
+        results = yolo.predict(**predict_kwargs)
+    except TypeError:
+        # half引数が未対応な古いバージョンへのフォールバック
+        predict_kwargs.pop("half", None)
+        results = yolo.predict(**predict_kwargs)
     boxes: List[Tuple[Tuple[int, int, int, int], float]] = []
     if not results:
         return boxes
@@ -696,7 +740,10 @@ def analyze_video(
             det_attrs: List[Tuple[int, str, Optional[np.ndarray]]] = []  # (age, gender, fused_emb)
             if do_detect:
                 dets = detect_faces_and_attrs(face_app, frame, conf_threshold=conf_threshold)
-                person_boxes = detect_person_boxes(yolo, frame, conf=body_conf)
+                # YOLOの入力解像度を顔検出サイズと揃える（短辺基準）
+                short_side = min(det_size[0], det_size[1]) if isinstance(det_size, tuple) else 640
+                yolo_use_half = torch.cuda.is_available() and (device.lower() in ("auto", "cuda", "gpu"))
+                person_boxes = detect_person_boxes(yolo, frame, conf=body_conf, imgsz=short_side, use_half=yolo_use_half)
                 last_detect_frame = frame_idx
                 used_person_indices: Set[int] = set()
                 for (fx, fy, fw, fh), conf, age, gender, face_emb in dets:
@@ -942,6 +989,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # A100向けのランタイム最適化
+    configure_cuda_runtime()
     try:
         dw, dh = [int(x) for x in str(args.det_size).lower().split("x")]
     except Exception:
