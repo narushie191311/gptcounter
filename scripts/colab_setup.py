@@ -64,7 +64,8 @@ def install_dependencies():
         "onnxruntime-gpu",
         "supervision",
         "annoy",
-        "gdown"
+        "gdown",
+        "psutil",  # システム監視
     ]
     
     for pkg in packages:
@@ -85,7 +86,7 @@ def setup_project():
     print("=== プロジェクト設定 ===")
     
     # ディレクトリ作成
-    dirs = ["outputs", "logs", "models", "models_insightface"]
+    dirs = ["outputs", "logs", "models", "models_insightface", "outputs/chunks"]
     for d in dirs:
         Path(d).mkdir(exist_ok=True)
         print(f"ディレクトリ作成: {d}")
@@ -135,9 +136,22 @@ uploaded = files.upload()
 VIDEO_PATH = list(uploaded.keys())[0]
 ```
 
-## 高精度解析実行
+## 究極性能解析実行（16コア並列 + ETA制御）
 ```python
 %cd /content/gptcounter
+
+# 究極品質 + ETA制御 + 16コア並列処理
+!python scripts/ultimate_parallel.py \\
+  --video "$VIDEO_PATH" \\
+  --chunks 16 \\
+  --config ultimate \\
+  --eta-target 3600 \\
+  --output-csv outputs/analysis_ultimate_16core.csv
+```
+
+## 高精度解析実行
+```python
+# 高精度設定
 !python scripts/analyze_video_mac.py \\
   --video "$VIDEO_PATH" \\
   --start-sec 0 --duration-sec 0 \\
@@ -175,27 +189,13 @@ from IPython.display import HTML
 HTML('<video src="outputs/preview_7200_30s.mp4" controls width="960"></video>')
 ```
 
-## 並列処理（長尺動画向け）
-```python
-# 4並列で分割処理
-!python scripts/parallel_shard.py \\
-  --video "$VIDEO_PATH" \\
-  --num-shards 4 \\
-  --device cuda \\
-  --yolo-weights yolov8m.pt \\
-  --reid-backend ensemble \\
-  --face-model buffalo_l \\
-  --gait-features \\
-  --det-size 1280x1280
-```
-
 ## 結果の確認
 ```python
 import pandas as pd
 import matplotlib.pyplot as plt
 
 # CSV読み込み
-df = pd.read_csv('outputs/analysis_colab.csv')
+df = pd.read_csv('outputs/analysis_ultimate_16core.csv')
 print(f"総検出数: {len(df)}")
 print(f"ユニーク人物数: {df['person_id'].nunique()}")
 
@@ -248,7 +248,7 @@ def main():
     print("1. gptcounter_colab.ipynb をColabにアップロード")
     print("2. ランタイム → ハードウェアアクセラレータ → GPU を選択")
     print("3. ノートブック内のセルを順次実行")
-    print("4. 動画ファイルのパスを設定して解析実行")
+    print("4. 究極性能16コア並列処理で解析実行")
 
 if __name__ == "__main__":
     main()
