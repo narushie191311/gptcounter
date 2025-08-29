@@ -552,6 +552,10 @@ def analyze_video(
     if resume_mode and (last_written_frame is not None) and last_written_frame > 0:
         target_frame = int(last_written_frame)
         start_sec = float(target_frame) / float(fps)
+        try:
+            print(f"[RESUME] last_frame={last_written_frame} -> seek to {start_sec:.2f}s and append to: {effective_csv_path}", flush=True)
+        except Exception:
+            pass
     else:
         cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
         # 一部のコーデックでは MSEC が効かないため冗長に設定
@@ -796,8 +800,12 @@ def analyze_video(
                 eta_info = f" | ETA: {eta_hours}h{eta_minutes}m"
             else:
                 eta_info = f" | ETA: {eta_minutes}m"
-        
-        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M:{male_count}(avg:{male_avg_age:.1f}) F:{female_count}(avg:{female_avg_age:.1f}) | elapsed={elapsed:.1f}s{eta_info}", flush=True)
+
+        # 実測処理速度/現行パラメータも出力（こまめなログ）
+        processed_frames = max(1, frame_idx - start_frame_pos)
+        fps_proc = processed_frames / max(1e-6, (now_wall - start_wall))
+        extra = f" stride={stride_frames} det={current_det_w}x{current_det_h} dN={current_detect_every_n} proc_fps={fps_proc:.1f}"
+        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M:{male_count}(avg:{male_avg_age:.1f}) F:{female_count}(avg:{female_avg_age:.1f}) | elapsed={elapsed:.1f}s{eta_info}{extra}", flush=True)
 
     def checkpoint(now_wall: float) -> None:
         # フラッシュして耐中断性を高める

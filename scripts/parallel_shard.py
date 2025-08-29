@@ -132,6 +132,8 @@ def main() -> None:
         idx += 1
 
     print(f"[PARALLEL] workers={max_workers}, chunks={len(chunks)} (chunk_sec={int(chunk_sec)}/{int(tail_chunk_sec)})")
+    # 既存ファイルスキャンのログ
+    print(f"[PARALLEL] work_dir={work_dir} base={base_name} video_id={video_id}")
 
     # 既存出力スキップ（互換: 旧shard名/新chunk名いずれも読み取り、カバー区間を算出）
     def hhmmss_to_sec(s: str) -> Optional[float]:
@@ -238,6 +240,7 @@ def main() -> None:
             if gpu_ids:
                 gpu_env = gpu_ids[i % len(gpu_ids)]
             cmd, env = make_cmd(s, d, op, gpu_env)
+            print(f"[DISPATCH] start={s:.1f}s dur={'tail' if (d==0.0 and total_sec>0) else d:.1f}s -> {op} gpu={gpu_env}")
             futs.append(ex.submit(run_proc, cmd, env))
         for fut in as_completed(futs):
             rcodes.append(fut.result())
