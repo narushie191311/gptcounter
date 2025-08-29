@@ -3,6 +3,7 @@ import argparse
 import os
 import re
 import subprocess
+from pathlib import Path
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,8 +20,8 @@ def sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:100]
 
 
-def run_proc(cmd: List[str], env: Optional[dict] = None) -> int:
-    p = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, env=env)
+def run_proc(cmd: List[str], env: Optional[dict] = None, cwd: Optional[str] = None) -> int:
+    p = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, env=env, cwd=cwd)
     return p.wait()
 
 
@@ -56,6 +57,11 @@ def main() -> None:
     work_dir = os.path.join(out_dir, f"parallel_{video_id}")
     os.makedirs(work_dir, exist_ok=True)
 
+    # プロジェクト/スクリプトの絶対パスを解決
+    scripts_dir = Path(__file__).resolve().parent
+    analyzer_path = str(scripts_dir / "analyze_video_mac.py")
+    project_root = str(scripts_dir.parent)
+
     # auto decide shards
     shards = int(args.shards)
     if shards <= 0:
@@ -64,7 +70,7 @@ def main() -> None:
         tmp_out = os.path.join(out_dir, f"{base_name}_warmup.csv")
         cmd = [
             sys.executable,
-            "scripts/analyze_video_mac.py",
+            analyzer_path,
             "--video", args.video,
             "--start-sec", "0",
             "--duration-sec", str(sample_sec),
@@ -75,7 +81,7 @@ def main() -> None:
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
         t0 = time.time()
-        run_proc(cmd)
+        run_proc(cmd, cwd=project_root)
         t1 = time.time()
         warm_speed = (sample_sec / max(1e-3, (t1 - t0)))  # video seconds per wall second
         # estimate needed parallelism
@@ -214,7 +220,7 @@ def main() -> None:
     def make_cmd(start_s: float, dur_s: float, out_csv: str, gpu_env: Optional[str]) -> Tuple[List[str], Optional[dict]]:
         cmd = [
             sys.executable,
-            "scripts/analyze_video_mac.py",
+            analyzer_path,
             "--video", args.video,
             "--start-sec", str(start_s),
             "--duration-sec", str(dur_s),
@@ -239,8 +245,9 @@ def main() -> None:
             if gpu_ids:
                 gpu_env = gpu_ids[i % len(gpu_ids)]
             cmd, env = make_cmd(s, d, op, gpu_env)
-            print(f"[DISPATCH] start={s:.1f}s dur={'tail' if (d==0.0 and total_sec>0) else d:.1f}s -> {op} gpu={gpu_env}")
-            futs.append(ex.submit(run_proc, cmd, env))
+            dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
+            print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
+            futs.append(ex.submit(run_proc, cmd, env, project_root))
         for fut in as_completed(futs):
             rcodes.append(fut.result())
     if any(r != 0 for r in rcodes):
