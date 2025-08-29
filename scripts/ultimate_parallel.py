@@ -33,7 +33,6 @@ class UltimateParallelProcessor:
         self.start_time = None
         self.chunk_results = []
         self.resume_file = str(Path(self.output_dir) / "parallel_resume_state.json")
-        self.lock = threading.Lock()
         
         # 設定読み込み（複数パスから検索）
         self.configs = self._load_config()
@@ -191,8 +190,6 @@ class UltimateParallelProcessor:
             
             if process.returncode == 0:
                 print(f"✓ チャンク {chunk_id} 完了")
-                with self.lock:
-                    self.chunk_results.append((True, chunk_id, output_csv))
                 return True, chunk_id, output_csv
             else:
                 print(f"✗ チャンク {chunk_id} 失敗")
@@ -303,6 +300,10 @@ class UltimateParallelProcessor:
         for success, chunk_id, output_csv in results:
             if success:
                 successful_chunks.append(output_csv)
+                # 親プロセス側で進捗を永続化
+                self.chunk_results.append((True, chunk_id, output_csv))
+        # 中断再開用に保存
+        self._save_resume_state()
         
         end_time = time.time()
         processing_time = end_time - self.start_time
