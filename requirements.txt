@@ -9,3 +9,6 @@ ultralytics>=8.2.0
 
 annoy>=1.17.3
 
+# Hardware decoding
+av>=10.0.0
+

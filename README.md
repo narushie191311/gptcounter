@@ -43,4 +43,33 @@ python scripts/person_summary.py --input-csv outputs/analysis.csv --video /conte
   --output-csv outputs/person_summary.csv --stats-out outputs/person_stats.csv | cat
 ```
 
+### 高品質・高速（強レジューム）Colab実行
+```bash
+# 高品質プリセット + 並列シャーディング + 中断再開対応
+chmod +x scripts/colab_quality_fast.sh
+bash scripts/colab_quality_fast.sh \
+  /content/merged_20250816_1141-1951.mkv \
+  outputs/analysis_colab.csv \
+  "--process-fps 0 --reid-cos 0.6 --gate-iou 0.25 --gate-sim 0.45"
+# 既存chunkは自動スキップされるため、再実行でレジューム可能
+```
+
+### ローカル最適化（Mac/CUDA 自動判定）
+```bash
+# Mac(MPS)やCUDAを自動判定し最適化で実行（MPS/TF32/Conv-BN fuse/TensorRT(任意)）
+python scripts/analyze_video_mac.py \
+  --video /path/to/video.mkv \
+  --output-csv outputs/analysis.csv \
+  --device auto \
+  --det-size 960x960 \
+  --detect-every-n 1 \
+  --trt-engine /path/to/yolov8n.engine  # (任意: 存在すれば優先)
+```
+
+### ハードウェアデコード（NVDEC/VideoToolbox）
+- Linux/A100: PyAV+NVDEC（自動判定）。CUDAデバイスを `CUDA_VISIBLE_DEVICES` から選択。
+- macOS: PyAV+VideoToolbox（自動判定）。未対応時はOpenCVにフォールバック。
+
+注意: ハードウェアデコードはドライバ/OS依存です。問題が出る場合は、環境変数 `FORCE_OPENCV_DECODER=1` を設定してOpenCVにフォールバックしてください。
+
 

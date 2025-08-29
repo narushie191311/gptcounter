@@ -127,7 +127,8 @@ def merge_persons_by_embedding(df_person: pd.DataFrame, emb_thresh: float, overl
 
 
 def summarize(input_csv: str, video_path: str, output_csv: str, emb_merge: bool, emb_thresh: float, overlap_veto_sec: float,
-              stats_out: Optional[str] = None, merge_max_dist_px: Optional[float] = None, cluster_from: str = "person") -> str:
+              stats_out: Optional[str] = None, merge_max_dist_px: Optional[float] = None, cluster_from: str = "person",
+              robust: bool = True, quality_threshold: float = 0.0, min_samples: int = 5) -> str:
     df = pd.read_csv(input_csv)
     # 4000人マージ後のCSVには merged_person_id が含まれる想定
     if "merged_person_id" in df.columns:
@@ -193,6 +194,71 @@ def summarize(input_csv: str, video_path: str, output_csv: str, emb_merge: bool,
     if emb_merge:
         person = merge_persons_by_embedding(person, emb_thresh=emb_thresh, overlap_veto_sec=overlap_veto_sec, max_dist_px=merge_max_dist_px)
 
+    # 品質重み付きロバスト集約（任意）
+    if robust and ("face_size" in df.columns or "sharpness" in df.columns):
+        # 品質スコア: face_sizeを正規化し、sharpnessと掛け合わせ
+        try:
+            # face_size 正規化（分位点でクリップ）
+            if "face_size" in df.columns:
+                fs = pd.to_numeric(df["face_size"], errors="coerce").fillna(0.0)
+                lo, hi = np.quantile(fs[fs>0], [0.05, 0.95]) if (fs>0).sum()>10 else (0.0, max(1.0, fs.max()))
+                fsn = (fs - lo) / max(1e-6, (hi - lo))
+                fsn = fsn.clip(0.0, 1.0)
+            else:
+                fsn = pd.Series(1.0, index=df.index)
+            if "sharpness" in df.columns:
+                sh = pd.to_numeric(df["sharpness"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+            else:
+                sh = pd.Series(1.0, index=df.index)
+            # 大きく・くっきり（近距離/高品質）を高く評価
+            qual = (fsn.pow(1.0) * sh.pow(1.5)).astype(float)
+            df["quality"] = qual
+        except Exception:
+            df["quality"] = 1.0
+        # person_id単位で年齢/性別を品質重み付きで再評価
+        def _robust_age(series: pd.Series, w: pd.Series) -> float:
+            vals = pd.to_numeric(series, errors="coerce")
+            m = (w > float(quality_threshold)).sum()
+            if m >= int(min_samples):
+                sel = vals[w > float(quality_threshold)]
+            else:
+                sel = vals
+            sel = sel.dropna()
+            if sel.empty:
+                return 0.0
+            # トリム平均（上下10%除去）
+            arr = np.sort(sel.values.astype(float))
+            k = max(0, int(len(arr) * 0.1))
+            core = arr[k: len(arr) - k] if len(arr) - k > k else arr
+            return float(np.median(core)) if len(core) > 0 else float(np.median(arr))
+        def _robust_gender(series: pd.Series, w: pd.Series) -> str:
+            s = series.fillna("")
+            keys = s.unique().tolist()
+            best, best_w = "", -1.0
+            for k in keys:
+                ww = float(w[s == k].sum())
+                if ww > best_w:
+                    best, best_w = k, ww
+            return str(best)
+        # 再集計
+        grouped = df.groupby(pid_col)
+        person = person.drop(columns=[c for c in ["age", "gender"] if c in person.columns], errors="ignore")
+        robust_rows = []
+        for pid, g in grouped:
+            w = g.get("quality", pd.Series(1.0, index=g.index))
+            age_val = _robust_age(g.get("age", pd.Series(dtype=float)), w)
+            gender_val = _robust_gender(g.get("gender", pd.Series(dtype=str)), w)
+            # 代表xc/ycは品質重み付き平均
+            try:
+                xc = float(np.average(g["xc"].astype(float), weights=w))
+                yc = float(np.average(g["yc"].astype(float), weights=w))
+            except Exception:
+                xc = float(g["xc"].mean())
+                yc = float(g["yc"].mean())
+            robust_rows.append((pid, age_val, gender_val, xc, yc))
+        robust_df = pd.DataFrame(robust_rows, columns=[pid_col, "age", "gender", "mean_xc", "mean_yc"])
+        person = person.merge(robust_df.rename(columns={pid_col: "person_id"}), on="person_id", how="left")
+
     # absolute timestamps
     if start_dt is not None:
         person["first_seen_at"] = person["start_sec"].map(lambda s: (start_dt + timedelta(seconds=float(s))).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
@@ -249,7 +315,7 @@ def _write_stats(person_df: pd.DataFrame, stats_out: str) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="personサマリ: person_id/検出からクラスタを作り、絶対時刻を付与（既定で埋め込みマージ有効）")
+    ap = argparse.ArgumentParser(description="personサマリ: person_id/検出からクラスタを作り、絶対時刻を付与（既定で埋め込みマージ有効）。品質重み付きロバスト集約をサポート")
     ap.add_argument("--input-csv", required=True)
     ap.add_argument("--video", required=True)
     ap.add_argument("--output-csv", required=True)
@@ -260,6 +326,9 @@ def main() -> None:
     ap.add_argument("--stats-out", default=None, help="性別/年齢帯の集計を書き出すCSVパス")
     ap.add_argument("--merge-max-dist-px", type=float, default=150.0, help="代表位置の距離がこのpxを超えるとマージしない")
     ap.add_argument("--cluster-from", choices=["person", "detection"], default="person")
+    ap.add_argument("--no-robust", dest="robust", action="store_false", help="品質重み付きロバスト集約を無効化")
+    ap.add_argument("--quality-threshold", type=float, default=0.3, help="品質スコアの下限（0-1）")
+    ap.add_argument("--min-samples", type=int, default=5, help="ロバスト集約に必要な最小サンプル数")
     args = ap.parse_args()
     # 既定でマージ有効
     if not hasattr(args, "merge_by_embedding"):
@@ -274,6 +343,9 @@ def main() -> None:
         args.stats_out,
         args.merge_max_dist_px,
         args.cluster_from,
+        args.robust,
+        args.quality_threshold,
+        args.min_samples,
     )
     print(out)
 
