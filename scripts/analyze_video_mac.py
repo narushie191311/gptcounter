@@ -547,7 +547,32 @@ def analyze_video(
     run_name = f"run_{run_stamp}" if not run_id else f"run_{run_stamp}_{run_id}"
     run_dir = os.path.join(out_dir, run_name)
     _ensure_dir(run_dir)
-    csv_file = open(output_csv, "w", newline="")
+
+    # 出力CSVはデフォルトで衝突しないよう run_dir 配下へ
+    # （ユーザーがoutputs配下に置く場合は自動で一意化。明示的に別ディレクトリを指定した場合は尊重）
+    dir_basename = os.path.basename(os.path.normpath(out_dir))
+    default_outputs_dir = (dir_basename == "outputs")
+    unique_output = True  # 既定で一意化
+    effective_csv_path = (
+        os.path.join(run_dir, os.path.basename(output_csv))
+        if (unique_output and default_outputs_dir)
+        else output_csv
+    )
+    # 便利リンク: 最新CSVへのシンボリックリンクを outputs に作成
+    if unique_output and default_outputs_dir:
+        try:
+            latest_link = os.path.join(out_dir, os.path.splitext(os.path.basename(output_csv))[0] + "_latest.csv")
+            if os.path.islink(latest_link) or os.path.exists(latest_link):
+                try:
+                    os.remove(latest_link)
+                except Exception:
+                    pass
+            os.symlink(os.path.abspath(effective_csv_path), latest_link)
+        except Exception:
+            # シンボリックリンクが使えない環境では無視
+            pass
+
+    csv_file = open(effective_csv_path, "w", newline="")
     writer = csv.writer(csv_file)
     writer.writerow(["timestamp", "frame", "person_id", "track_id", "age", "gender", "x", "y", "w", "h", "conf", "embedding_b64", "absolute_timestamp"])
 
@@ -561,7 +586,7 @@ def analyze_video(
 
     vw = None
     if save_video:
-        out_path = video_out_path or os.path.splitext(output_csv)[0] + ".mp4"
+        out_path = video_out_path or os.path.splitext(effective_csv_path)[0] + ".mp4"
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     # Progress/Stats
@@ -921,7 +946,7 @@ def analyze_video(
                     break
             if save_video:
                 if vw is None:
-                    out_path = video_out_path or os.path.splitext(output_csv)[0] + ".mp4"
+                    out_path = video_out_path or os.path.splitext(effective_csv_path)[0] + ".mp4"
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     h, w = frame.shape[:2]
                     vw = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
