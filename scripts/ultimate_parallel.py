@@ -33,6 +33,8 @@ class UltimateParallelProcessor:
         self.start_time = None
         self.chunk_results = []
         self.resume_file = str(Path(self.output_dir) / "parallel_resume_state.json")
+        # プロジェクトルート（/content/gptcounter のようなディレクトリ）
+        self.project_root = Path(__file__).resolve().parent.parent
         
         # 設定読み込み（複数パスから検索）
         self.configs = self._load_config()
@@ -157,11 +159,8 @@ class UltimateParallelProcessor:
         return False
     
     def process_chunk_with_monitoring(self, args):
-        """監視付きチャンク処理"""
+        """チャンク処理（サブプロセスのstdout/stderrを取得して可視化）"""
         chunk_id, start_sec, duration_sec = args
-        
-        # GPU使用率監視
-        gpu_monitor = GPUMonitor()
         
         output_csv = f"{self.chunks_dir}/chunk_{chunk_id:03d}.csv"
         output_video = f"{self.chunks_dir}/chunk_{chunk_id:03d}.mp4"
@@ -171,57 +170,50 @@ class UltimateParallelProcessor:
         print(f"チャンク {chunk_id}: {start_sec}s - {start_sec + duration_sec}s 開始")
         
         try:
-            # 処理開始
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
-            # リアルタイム監視
-            while process.poll() is None:
-                gpu_stats = gpu_monitor.get_stats()
-                
-                # GPUメモリ不足時の対応
-                if gpu_stats["memory_used"] > gpu_stats["memory_total"] * 0.9:
-                    print(f"⚠️ チャンク {chunk_id}: GPUメモリ不足 - 処理を一時停止")
-                    process.terminate()
-                    time.sleep(5)
-                    # 軽量設定で再試行
-                    return self._retry_with_light_config(chunk_id, start_sec, duration_sec)
-                
-                time.sleep(2)
-            
-            if process.returncode == 0:
+            # 絶対パス + 固定cwdで実行（相対パス問題を回避）
+            result = subprocess.run(
+                cmd, cwd=str(self.project_root), capture_output=True, text=True
+            )
+            if result.returncode == 0:
                 print(f"✓ チャンク {chunk_id} 完了")
+                if result.stdout:
+                    print(result.stdout[:500])
                 return True, chunk_id, output_csv
             else:
-                print(f"✗ チャンク {chunk_id} 失敗")
+                print(f"✗ チャンク {chunk_id} 失敗 (code={result.returncode})")
+                if result.stdout:
+                    print(f"[stdout]\n{result.stdout[:1000]}")
+                if result.stderr:
+                    print(f"[stderr]\n{result.stderr[:2000]}")
                 return False, chunk_id, None
-                
         except Exception as e:
             print(f"✗ チャンク {chunk_id} エラー: {e}")
             return False, chunk_id, None
     
     def _build_chunk_command(self, chunk_id, start_sec, duration_sec, output_csv, output_video):
-        """チャンク処理コマンドを構築"""
-        cmd = f'''python scripts/analyze_video_mac.py \\
-          --video "{self.video_path}" \\
-          --start-sec {start_sec} \\
-          --duration-sec {duration_sec} \\
-          --output-csv {output_csv} \\
-          --device cuda \\
-          --yolo-weights {self.config['yolo_weights']} \\
-          --reid-backend {self.config['reid_backend']} \\
-          --face-model {self.config['face_model']} \\
-          --det-size {self.config['det_size']} \\
-          --detect-every-n {self.config['detect_every_n']} \\
-          --log-every-sec {self.config['log_every_sec']} \\
-          --checkpoint-every-sec {self.config['checkpoint_every_sec']} \\
-          --merge-every-sec {self.config['merge_every_sec']} \\
-          --flush-every-n {self.config['flush_every_n']} \\
-          --save-video --video-out {output_video} \\
-          --no-show'''
-        
+        """チャンク処理コマンド（リスト形式）を構築（安全な実行）"""
+        script_path = str(self.project_root / "scripts" / "analyze_video_mac.py")
+        cmd = [
+            sys.executable, script_path,
+            "--video", str(self.video_path),
+            "--start-sec", str(start_sec),
+            "--duration-sec", str(duration_sec),
+            "--output-csv", str(output_csv),
+            "--device", "cuda",
+            "--yolo-weights", str(self.config['yolo_weights']),
+            "--reid-backend", str(self.config['reid_backend']),
+            "--face-model", str(self.config['face_model']),
+            "--det-size", str(self.config['det_size']),
+            "--detect-every-n", str(self.config['detect_every_n']),
+            "--log-every-sec", str(self.config['log_every_sec']),
+            "--checkpoint-every-sec", str(self.config['checkpoint_every_sec']),
+            "--merge-every-sec", str(self.config['merge_every_sec']),
+            "--flush-every-n", str(self.config['flush_every_n']),
+            "--save-video", "--video-out", str(output_video),
+            "--no-show",
+        ]
         if self.config.get('gait_features'):
-            cmd += " --gait-features"
-        
+            cmd.append("--gait-features")
         return cmd
     
     def _retry_with_light_config(self, chunk_id, start_sec, duration_sec):
@@ -236,23 +228,30 @@ class UltimateParallelProcessor:
         }
         
         # 軽量設定でコマンド再構築
-        cmd = f'''python scripts/analyze_video_mac.py \\
-          --video "{self.video_path}" \\
-          --start-sec {start_sec} \\
-          --duration-sec {duration_sec} \\
-          --output-csv {self.chunks_dir}/chunk_{chunk_id:03d}_light.csv \\
-          --device cuda \\
-          --yolo-weights {light_config['yolo_weights']} \\
-          --det-size {light_config['det_size']} \\
-          --detect-every-n {light_config['detect_every_n']} \\
-          --no-show'''
+        light_script = str(self.project_root / "scripts" / "analyze_video_mac.py")
+        cmd = [
+            sys.executable, light_script,
+            "--video", str(self.video_path),
+            "--start-sec", str(start_sec),
+            "--duration-sec", str(duration_sec),
+            "--output-csv", f"{self.chunks_dir}/chunk_{chunk_id:03d}_light.csv",
+            "--device", "cuda",
+            "--yolo-weights", str(light_config['yolo_weights']),
+            "--det-size", str(light_config['det_size']),
+            "--detect-every-n", str(light_config['detect_every_n']),
+            "--no-show",
+        ]
         
         try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            result = subprocess.run(cmd, cwd=str(self.project_root), capture_output=True, text=True)
             if result.returncode == 0:
                 print(f"✓ チャンク {chunk_id} 軽量設定で完了")
                 return True, chunk_id, f"{self.chunks_dir}/chunk_{chunk_id:03d}_light.csv"
             else:
+                if result.stdout:
+                    print(f"[stdout]\n{result.stdout[:1000]}")
+                if result.stderr:
+                    print(f"[stderr]\n{result.stderr[:2000]}")
                 return False, chunk_id, None
         except:
             return False, chunk_id, None
