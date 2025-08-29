@@ -101,10 +101,9 @@ def main() -> None:
     ap.add_argument("--procs-per-gpu", type=int, default=1, help="parallel processes per GPU")
     ap.add_argument("--skip-existing", type=int, default=1, help="skip chunks already written (1=yes,0=no)")
     ap.add_argument("--online-merge", type=int, default=1, help="enable analyzer online merge (1) or disable (0)")
+    ap.add_argument("--raw-output", default="", help="final merged RAW (non-merged-by-IDs) CSV path. If set, per-chunk raw files are auto-generated and merged here")
     ap.add_argument("--per-chunk-timeout-sec", type=float, default=0.0, help="kill a chunk if it exceeds this wall time (0=disable)")
     ap.add_argument("--prewarm-sec", type=float, default=2.0, help="run a short single analyzer to pre-download models (0=disable)")
-    ap.add_argument("--save-raw", type=int, default=1, help="also save per-chunk raw CSV via --output-csv-raw (1=yes,0=no)")
-    ap.add_argument("--raw-dir", default="", help="directory to store per-chunk raw CSVs (default=work_dir)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -211,6 +210,7 @@ def main() -> None:
     chunk_sec = max(30.0, float(args.chunk_sec))
     tail_chunk_sec = max(30.0, float(args.tail_chunk_sec))
     chunks: List[Tuple[float, float, str]] = []  # (start_sec, duration_sec, out_path)
+    raw_chunks: List[Tuple[float, float, str]] = []  # raw csv paths parallel to chunks
     cur = 0.0
     idx = 0
     # 末尾20%は小さめのチャンク
@@ -224,6 +224,10 @@ def main() -> None:
             dur = 0.0
         out_path = os.path.join(work_dir, f"{base_name}_chunk_{int(start_s)}s.csv")
         chunks.append((start_s, dur, out_path))
+        # per-chunk RAW path if requested
+        if args.raw_output.strip():
+            raw_name = os.path.join(work_dir, f"{base_name}_raw_chunk_{int(start_s)}s.csv")
+            raw_chunks.append((start_s, dur, raw_name))
         if dur == 0.0:
             break
         cur += this_chunk
@@ -310,7 +314,7 @@ def main() -> None:
             filtered.append((s, d, op))
         chunks = filtered
     rcodes = []
-    def make_cmd(start_s: float, dur_s: float, out_csv: str, gpu_env: Optional[str]) -> Tuple[List[str], Optional[dict]]:
+    def make_cmd(start_s: float, dur_s: float, out_csv: str, gpu_env: Optional[str], raw_csv: Optional[str]) -> Tuple[List[str], Optional[dict]]:
         cmd = [
             sys.executable,
             analyzer_path,
@@ -322,16 +326,12 @@ def main() -> None:
         ]
         if int(args.online_merge) == 0:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
+        # add per-chunk raw path unless user already forced one in extra-args
+        if raw_csv is not None and raw_csv.strip():
+            if "--output-csv-raw" not in args.extra_args:
+                cmd += ["--output-csv-raw", raw_csv]
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
-        # add per-chunk raw output unless user already set it in extra-args
-        if int(args.save_raw) == 1:
-            extra_joined = " ".join(cmd)
-            if "--output-csv-raw" not in extra_joined:
-                raw_dir = args.raw_dir.strip() or work_dir
-                os.makedirs(raw_dir, exist_ok=True)
-                raw_path = os.path.join(raw_dir, f"{base_name}_chunk_{int(start_s)}s_raw.csv")
-                cmd += ["--output-csv-raw", raw_path]
         env = None
         if gpu_env is not None:
             env = os.environ.copy()
@@ -356,7 +356,11 @@ def main() -> None:
                 gpu_env = None
                 if gpu_ids:
                     gpu_env = gpu_ids[i % len(gpu_ids)]
-                cmd, env = make_cmd(s, d, op, gpu_env)
+                raw_op = None
+                if args.raw_output.strip():
+                    # align by index since we appended in parallel above
+                    raw_op = raw_chunks[i][2] if i < len(raw_chunks) else None
+                cmd, env = make_cmd(s, d, op, gpu_env, raw_op)
                 dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
                 print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
                 futs.append(ex.submit(run_proc_streaming, cmd, env, project_root, float(args.per_chunk_timeout_sec)))
@@ -402,6 +406,26 @@ def main() -> None:
                     else:
                         fo.write(line)
     print(f"[PARALLEL] merged -> {final_out}")
+
+    # RAWの結合（ユーザーが要求した場合）
+    if args.raw_output.strip():
+        raw_final = args.raw_output.strip()
+        raw_dir = os.path.dirname(raw_final)
+        if raw_dir:
+            os.makedirs(raw_dir, exist_ok=True)
+        with open(raw_final, "w", newline="") as fo:
+            wrote_header_raw = False
+            for (s, d, rp) in sorted(raw_chunks, key=lambda x: x[0]):
+                if not os.path.exists(rp):
+                    continue
+                with open(rp, newline="") as fi:
+                    header = fi.readline().rstrip("\n")
+                    if not wrote_header_raw:
+                        fo.write(header + "\n")
+                        wrote_header_raw = True
+                    for line in fi:
+                        fo.write(line)
+        print(f"[PARALLEL] raw merged -> {raw_final}")
 
 
 if __name__ == "__main__":
