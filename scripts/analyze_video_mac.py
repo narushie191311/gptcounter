@@ -225,9 +225,9 @@ def detect_person_boxes(
     if use_half:
         predict_kwargs["half"] = True
     try:
-        # heavy but more stable: increase overlap/augment for recall if large faces
+        # 高解像度時はややリコール寄り（conf を少し下げる）
         if imgsz and imgsz >= 1280:
-            predict_kwargs["overlap"] = 0.7
+            predict_kwargs["conf"] = max(0.2, min(float(predict_kwargs.get("conf", 0.5)), 0.5))
         results = yolo.predict(**predict_kwargs)
     except TypeError:
         # half引数が未対応な古いバージョンへのフォールバック
