@@ -573,6 +573,65 @@ def _compute_face_quality_metrics(frame: np.ndarray, box: Tuple[int, int, int, i
         return 0.0, 0.0
 
 
+def _extract_clothing_features(frame: np.ndarray, person_box: Optional[Tuple[int, int, int, int]]) -> Optional[Dict[str, float]]:
+    if person_box is None:
+        return None
+    try:
+        x, y, w, h = [int(v) for v in person_box]
+        H, W = frame.shape[:2]
+        x = max(0, min(x, W - 1)); y = max(0, min(y, H - 1))
+        w = max(1, min(w, W - x)); h = max(1, min(h, H - y))
+        crop = frame[y:y + h, x:x + w]
+        if crop.size == 0 or h < 40 or w < 20:
+            return None
+        upper = crop[: max(1, int(h * 0.5)), :]
+        lower = crop[max(1, int(h * 0.5)) :, :]
+        upper_hsv = cv2.cvtColor(upper, cv2.COLOR_BGR2HSV)
+        lower_hsv = cv2.cvtColor(lower, cv2.COLOR_BGR2HSV)
+        # Hue histogram (18 bins)
+        uh = cv2.calcHist([upper_hsv], [0], None, [18], [0, 180]).flatten().astype(np.float32)
+        uh = uh / max(uh.sum(), 1e-6)
+        # Saturation mean
+        us = float(np.mean(upper_hsv[:, :, 1])) / 255.0
+        # Edge density (upper)
+        ug = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY)
+        ed = float(np.mean(cv2.Canny(ug, 50, 150) > 0))
+        # Silhouette ratio (expanding to bottom)
+        width_top = float(np.mean(lower[: max(1, int(h * 0.1)), :]))
+        width_bottom = float(np.mean(lower[max(1, int(-h * 0.1)) :, :]))
+        sil = (width_bottom + 1.0) / (width_top + 1.0)
+        # Brightness contrast (std)
+        brightness_std = float(np.std(ug)) / 128.0
+        return {"upper_h_bins": 18.0, "uh0": uh[0] if uh.size >= 1 else 0.0, "uh1": uh[1] if uh.size >= 2 else 0.0,
+                "uh16": uh[16] if uh.size >= 17 else 0.0, "uh17": uh[17] if uh.size >= 18 else 0.0,
+                "uh9_13": float(np.sum(uh[9:13]) if uh.size >= 14 else 0.0),
+                "sat": us, "edge": ed, "sil": sil, "bstd": brightness_std}
+    except Exception:
+        return None
+
+
+def _predict_gender_from_clothing(feat: Dict[str, float]) -> Tuple[str, float]:
+    # Rule-based, tuned for JP events: pink/sat/silhouette -> female, blue -> male
+    pink = float(feat.get("uh0", 0.0) + feat.get("uh1", 0.0) + feat.get("uh16", 0.0) + feat.get("uh17", 0.0))
+    blue = float(feat.get("uh9_13", 0.0))
+    sat = float(feat.get("sat", 0.0))
+    sil = float(feat.get("sil", 1.0))
+    edge = float(feat.get("edge", 0.0))
+    bstd = float(feat.get("bstd", 0.0))
+    score = 0.5
+    score += 0.35 * pink
+    score -= 0.20 * blue
+    score += 0.20 * sat
+    if sil > 1.15:
+        score += 0.20
+    if edge > 0.10:
+        score += 0.05
+    score += 0.05 * bstd
+    conf = float(min(1.0, abs(score - 0.5) * 2.0))
+    gender = "Female" if score >= 0.5 else "Male"
+    return gender, conf
+
+
 class StatsAccumulator:
     def __init__(self) -> None:
         self.gender_to_count: Dict[str, int] = {"Male": 0, "Female": 0, "": 0}
@@ -617,6 +676,7 @@ def compute_geom_features(frame: np.ndarray, box: Tuple[int, int, int, int]) -> 
 def analyze_video(
     video_path: str,
     output_csv: str,
+    output_csv_raw: Optional[str],
     start_sec: float,
     duration_sec: float,
     show_window: bool = True,
@@ -879,6 +939,26 @@ def analyze_video(
 
     csv_file = open(effective_csv_path, ("a" if resume_mode else "w"), newline="")
     writer = csv.writer(csv_file)
+    # raw（非マージ）出力の準備（任意）
+    raw_writer: Optional[csv.writer] = None
+    raw_file = None
+    if output_csv_raw:
+        raw_dir = os.path.dirname(output_csv_raw) or "."
+        os.makedirs(raw_dir, exist_ok=True)
+        raw_file = open(output_csv_raw, "w", newline="")
+        raw_writer = csv.writer(raw_file)
+        raw_writer.writerow([
+            "timestamp",
+            "ts_from_file_start",
+            "frame",
+            "face_x","face_y","face_w","face_h",
+            "person_x","person_y","person_w","person_h",
+            "face_conf",
+            "age_face","gender_face",
+            "gender_clothing","gender_clothing_conf",
+            "face_size","sharpness",
+            "embedding_b64",
+        ])
     # 実行開始時刻（JST）を列に保持（各行に同値を書き込む）
     run_started_utc = datetime.now(timezone.utc)
     run_started_jst_dt = run_started_utc.astimezone(ZoneInfo("Asia/Tokyo")) if ZoneInfo else run_started_utc
@@ -1149,6 +1229,12 @@ def analyze_video(
                             best_i, best_pb, best_pb_idx = i, pb, idx
                     if best_pb_idx is not None:
                         used_person_indices.add(best_pb_idx)
+                    # 服装特徴/性別補助
+                    clothing_feat = _extract_clothing_features(frame, best_pb)
+                    clothing_gender, clothing_conf = ("", 0.0)
+                    if clothing_feat is not None:
+                        cg, cc = _predict_gender_from_clothing(clothing_feat)
+                        clothing_gender, clothing_conf = cg, cc
                     # 体埋め込み: HSVヒスト/OSNet/アンサンブル
                     body_emb_hist = compute_body_embedding(frame, best_pb) if (best_pb is not None and reid_backend in ("hist", "ensemble")) else None
                     body_emb_osn = None
@@ -1181,6 +1267,38 @@ def analyze_video(
                     fs_norm = min(1.0, max(0.0, fsize / max(1.0, 0.2 * W * H)))
                     wq = float(fs_norm * (sharp ** 1.5))
                     det_quality_weights.append(max(0.05, wq))
+                    # 非マージ（raw）書き込み
+                    if raw_writer is not None:
+                        # ts文字列
+                        fps_val = float(fps)
+                        current_video_sec = (frame_idx / fps_val)
+                        ts_str = format_timestamp(current_video_sec - start_sec)
+                        ts_from_file_start = format_timestamp(current_video_sec)
+                        # person box
+                        if best_pb is not None:
+                            px, py, pw, ph = best_pb
+                        else:
+                            px = py = pw = ph = 0
+                        # embedding b64（fusedがあれば優先）
+                        emb_src = fused if fused is not None else face_emb
+                        emb_b64 = ""
+                        if emb_src is not None:
+                            try:
+                                emb_b64 = base64.b64encode(np.asarray(emb_src, dtype=np.float32).tobytes()).decode("ascii")
+                            except Exception:
+                                emb_b64 = ""
+                        raw_writer.writerow([
+                            ts_str, ts_from_file_start, frame_idx,
+                            fx, fy, fw, fh,
+                            px, py, pw, ph,
+                            f"{conf:.3f}",
+                            age if age else "",
+                            gender if gender else "",
+                            clothing_gender,
+                            f"{clothing_conf:.2f}",
+                            f"{fsize:.1f}", f"{sharp:.3f}",
+                            emb_b64,
+                        ])
                     # 顔ボックスをトラッキングボックスとして使用
                     boxes.append((fx, fy, fw, fh))
                     confidences.append(conf)
@@ -1461,6 +1579,12 @@ def analyze_video(
                     frame_idx = next_pos
     finally:
         csv_file.close()
+        if raw_writer is not None and raw_file is not None:
+            try:
+                raw_file.flush()
+            except Exception:
+                pass
+            raw_file.close()
         if cap is not None:
             cap.release()
         if show_window:
@@ -1475,6 +1599,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start-sec", type=float, default=1800.0, help="開始秒(例: 1800=30分)")
     p.add_argument("--duration-sec", type=float, default=0.0, help="解析する秒数（0または省略で動画の最後まで）")
     p.add_argument("--output-csv", default=os.path.join("outputs", "analysis.csv"))
+    p.add_argument("--output-csv-raw", default=None, help="非マージ（raw）行を併記保存するCSVパス（任意）")
     p.add_argument("--no-show", action="store_true", help="ウィンドウ表示を無効化")
     p.add_argument("--detect-every-n", type=int, default=5, help="Nフレーム毎に検出")
     p.add_argument("--conf", type=float, default=0.6, help="顔検出の信頼度しきい値")
@@ -1524,6 +1649,7 @@ def main() -> None:
     analyze_video(
         video_path=args.video,
         output_csv=args.output_csv,
+        output_csv_raw=args.output_csv_raw,
         start_sec=args.start_sec,
         duration_sec=args.duration_sec,
         show_window=show_flag,
