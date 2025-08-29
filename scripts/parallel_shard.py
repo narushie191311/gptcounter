@@ -33,6 +33,7 @@ def main() -> None:
     ap.add_argument("--target-wall-min", type=float, default=0.0, help="target wall time minutes for auto shards")
     ap.add_argument("--warmup-sec", type=float, default=30.0, help="warmup seconds for auto shards")
     ap.add_argument("--mem-per-proc-gb", type=float, default=4.0, help="estimate VRAM per process for cap")
+    ap.add_argument("--chunk-sec", type=float, default=600.0, help="chunk duration seconds for dynamic scheduling")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -97,37 +98,46 @@ def main() -> None:
     shards = max(1, shards)
     per_sec = total_sec / shards if total_sec > 0 else 0
 
-    jobs = []
-    for i in range(shards):
-        s = max(0.0, per_sec * i)
-        d = 0.0 if i == shards - 1 else max(0.0, per_sec)  # 最終シャードは末尾まで
-        shard_out = os.path.join(work_dir, f"{base_name}_shard{i+1}of{shards}.csv")
+    # 動的スケジューリング: チャンクのキューを作成
+    chunk_sec = max(30.0, float(args.chunk_sec))
+    chunks = []  # (start_sec, duration_sec, out_path)
+    cur = 0.0
+    idx = 0
+    while cur < total_sec or (total_sec == 0 and idx == 0):
+        dur = chunk_sec if (total_sec <= 0 or cur + chunk_sec < total_sec) else max(0.0, total_sec - cur)
+        start_s = max(0.0, cur)
+        # 最終チャンクは末尾まで（duration=0）
+        if total_sec > 0 and cur + chunk_sec >= total_sec:
+            dur = 0.0
+        out_path = os.path.join(work_dir, f"{base_name}_chunk_{int(start_s)}s.csv")
+        chunks.append((start_s, dur, out_path))
+        if dur == 0.0:
+            break
+        cur += chunk_sec
+        idx += 1
+
+    print(f"[PARALLEL] workers={shards}, chunks={len(chunks)} (chunk_sec={int(chunk_sec)})")
+    rcodes = []
+    def make_cmd(start_s: float, dur_s: float, out_csv: str) -> List[str]:
         cmd = [
             sys.executable,
             "scripts/analyze_video_mac.py",
-            "--video",
-            args.video,
-            "--start-sec",
-            str(s),
-            "--duration-sec",
-            str(d),
-            "--output-csv",
-            shard_out,
-            "--no-show",
-            "--device",
-            "cuda",
-            "--no-merge",
-            "--merge-every-sec",
-            "0",
+            "--video", args.video,
+            "--start-sec", str(start_s),
+            "--duration-sec", str(dur_s),
+            "--output-csv", out_csv,
+            "--no-show", "--device", "cuda",
+            "--no-merge", "--merge-every-sec", "0",
         ]
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
-        jobs.append(cmd)
+        return cmd
 
-    print(f"[PARALLEL] launching {len(jobs)} shards ...")
-    rcodes = []
-    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
-        futs = [ex.submit(run_proc, cmd) for cmd in jobs]
+    # スレッドプールでワークキューを消化（速いワーカーが遅いチャンクを自動的に担当）
+    with ThreadPoolExecutor(max_workers=shards) as ex:
+        futs = []
+        for (s, d, op) in chunks:
+            futs.append(ex.submit(run_proc, make_cmd(s, d, op)))
         for fut in as_completed(futs):
             rcodes.append(fut.result())
     if any(r != 0 for r in rcodes):
@@ -137,9 +147,11 @@ def main() -> None:
     final_out = os.path.join(out_dir, f"{base_name}_{video_id}_merged.csv")
     with open(final_out, "w", newline="") as fo:
         wrote_header = False
-        for i in range(shards):
-            shard_out = os.path.join(work_dir, f"{base_name}_shard{i+1}of{shards}.csv")
-            with open(shard_out, newline="") as fi:
+        # start_sec でソートして結合
+        for (s, d, op) in sorted(chunks, key=lambda x: x[0]):
+            if not os.path.exists(op):
+                continue
+            with open(op, newline="") as fi:
                 header = fi.readline().rstrip("\n")
                 cols = header.split(",")
                 if not wrote_header:
