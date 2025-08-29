@@ -189,6 +189,9 @@ class UltimateParallelProcessor:
             env.setdefault("ORT_DISABLE_TENSORRT", "1")
             env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
             env.setdefault("INSIGHTFACE_HOME", str(self.project_root / "models_insightface" / "models"))
+            # 追加の安定化フラグ（解析側でも参照）
+            env.setdefault("DISABLE_TRT_EXPORT", "1")
+            env.setdefault("ORT_FORCE_CPU_FOR_FACE", "1")
             result = subprocess.run(
                 cmd, cwd=str(self.project_root), capture_output=True, text=True, env=env
             )
@@ -224,6 +227,7 @@ class UltimateParallelProcessor:
             "--duration-sec", str(duration_sec),
             "--output-csv", str(output_csv),
             "--device", "cuda",
+            "--no-trt-export",
             "--yolo-weights", str(self.config['yolo_weights']),
             "--reid-backend", str(self.config['reid_backend']),
             "--face-model", str(self.config['face_model']),

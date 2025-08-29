@@ -642,7 +642,8 @@ def analyze_video(
 
     # Face/YOLO 初期化
     face_app = init_face_app(det_w=current_det_w, det_h=current_det_h, device=device, face_model=face_model)
-    if trt_engine is None and yolo_weights and (device.lower() in ("cuda", "auto")) and torch.cuda.is_available():
+    disable_trt_export_env = bool(os.environ.get("DISABLE_TRT_EXPORT", "0") == "1")
+    if (not disable_trt_export_env) and trt_engine is None and yolo_weights and (device.lower() in ("cuda", "auto")) and torch.cuda.is_available():
         built_engine = ensure_trt_engine(yolo_weights)
         if built_engine:
             trt_engine = built_engine
@@ -1473,6 +1474,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run-id", default=None, help="出力run名に付与する任意ID")
     p.add_argument("--process-fps", type=float, default=0.0, help="1秒あたりの処理フレーム数（0で全フレーム）")
     p.add_argument("--trt-engine", default=None, help="TensorRTエンジンパス（存在すれば優先使用）")
+    p.add_argument("--no-trt-export", action="store_true", help="YOLOのTensorRTエクスポートを行わない（安定化向け）")
     p.add_argument("--yolo-weights", default="yolov8n.pt", help="YOLOの重み（例: yolov8l.pt, yolov10x.pt, カスタム.pt）")
     p.add_argument("--face-model", default="buffalo_l", help="InsightFaceモデル名（例: buffalo_l, antelopev2 など）")
     p.add_argument("--reid-backend", choices=["hist", "osnet", "ensemble"], default="hist", help="体外観埋め込みのバックエンド")
@@ -1521,7 +1523,7 @@ def main() -> None:
         no_merge=args.no_merge,
         run_id=args.run_id,
         process_fps=args.process_fps,
-        trt_engine=args.trt_engine,
+        trt_engine=(None if args.no_trt_export else args.trt_engine),
         yolo_weights=args.yolo_weights,
         face_model=args.face_model,
         reid_backend=args.reid_backend,
