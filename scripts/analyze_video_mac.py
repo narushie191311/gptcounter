@@ -452,6 +452,7 @@ def analyze_video(
     checkpoint_every_sec: float = 60.0,
     merge_every_sec: float = 60.0,
     flush_every_n: int = 5,
+    no_merge: bool = False,
     run_id: Optional[str] = None,
 ) -> None:
     face_app = init_face_app(det_w=int(det_size[0]), det_h=int(det_size[1]), device=device)
@@ -484,7 +485,15 @@ def analyze_video(
     cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
     start_frame_pos = target_frame
 
-    tracker = EmbeddingTracker(iou_gate=gate_iou, sim_gate=gate_sim, max_missed=int(fps * 2), reid=PersonRegistry(cosine_thresh=reid_cosine_thresh))
+    # マージ処理の設定
+    if no_merge:
+        # マージ処理を完全に無効化
+        tracker = EmbeddingTracker(iou_gate=1.0, sim_gate=1.0, max_missed=int(fps * 2), reid=PersonRegistry(cosine_thresh=1.0))
+        print(f"[INFO] マージ処理を完全に無効化しました", flush=True)
+    else:
+        # 通常のマージ処理
+        tracker = EmbeddingTracker(iou_gate=gate_iou, sim_gate=gate_sim, max_missed=int(fps * 2), reid=PersonRegistry(cosine_thresh=reid_cosine_thresh))
+        print(f"[INFO] マージ処理: IoU={gate_iou}, Sim={gate_sim}, ReID={reid_cosine_thresh}", flush=True)
     # attribute memory for external trackers
     ext_attr: Dict[int, Dict[str, object]] = {}
 
@@ -926,6 +935,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-every-sec", type=float, default=30.0, help="CSVフラッシュ/履歴追記の周期(秒)")
     p.add_argument("--merge-every-sec", type=float, default=60.0, help="軽量マージスナップショットの周期(秒, 0で無効)")
     p.add_argument("--flush-every-n", type=int, default=30, help="CSVフラッシュの間隔（フレーム数、30で30フレーム毎）")
+    p.add_argument("--no-merge", action="store_true", help="マージ処理を完全に無効化")
     p.add_argument("--run-id", default=None, help="出力run名に付与する任意ID")
     return p.parse_args()
 
@@ -965,6 +975,7 @@ def main() -> None:
         checkpoint_every_sec=args.checkpoint_every_sec,
         merge_every_sec=args.merge_every_sec,
         flush_every_n=args.flush_every_n,
+        no_merge=args.no_merge,
         run_id=args.run_id,
     )
 

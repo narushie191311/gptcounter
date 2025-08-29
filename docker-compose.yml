@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  gptcounter:
+    build: .
+    container_name: gptcounter-runpod
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_VISIBLE_DEVICES=0,1,2,3
+    volumes:
+      - ./outputs:/workspace/gptcounter/outputs
+      - ./videos:/workspace/gptcounter/videos
+      - ./models:/workspace/gptcounter/models
+    ports:
+      - "8888:8888"  # Jupyter Notebook用（必要に応じて）
+    working_dir: /workspace/gptcounter
+    command: /bin/bash
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
