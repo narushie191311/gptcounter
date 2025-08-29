@@ -486,6 +486,7 @@ def analyze_video(
     flush_every_n: int = 5,
     no_merge: bool = False,
     run_id: Optional[str] = None,
+    process_fps: float = 0.0,
 ) -> None:
     face_app = init_face_app(det_w=int(det_size[0]), det_h=int(det_size[1]), device=device)
     yolo = init_person_detector(device=device)
@@ -506,6 +507,13 @@ def analyze_video(
         raise RuntimeError(f"動画を開けません: {video_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    # 1秒あたりの処理フレーム数（0 で無効）。指定時はフレームを間引く
+    stride_frames = 1
+    if process_fps and process_fps > 0:
+        try:
+            stride_frames = max(1, int(round(float(fps) / float(process_fps))))
+        except Exception:
+            stride_frames = 1
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     # 動画の全体長を計算（秒）
     total_video_duration = total_frames / fps if total_frames > 0 and fps > 0 else 0
@@ -768,7 +776,10 @@ def analyze_video(
                 if frame_idx >= total_frames - 1:
                     break
 
-            do_detect = (frame_idx - last_detect_frame) >= (1 if tracker_backend in ("bytetrack", "strongsort") else detect_every_n)
+            effective_detect_every = 1 if tracker_backend in ("bytetrack", "strongsort") else detect_every_n
+            if stride_frames > 1 and effective_detect_every > 1:
+                effective_detect_every = max(1, int(round(effective_detect_every / stride_frames)))
+            do_detect = (frame_idx - last_detect_frame) >= effective_detect_every
             boxes: List[Tuple[int, int, int, int]] = []
             confidences: List[float] = []
             det_attrs: List[Tuple[int, str, Optional[np.ndarray]]] = []  # (age, gender, fused_emb)
@@ -996,6 +1007,12 @@ def analyze_video(
             if now_wall >= next_merge_wall:
                 threading.Thread(target=launch_merge_snapshot, daemon=True).start()
                 next_merge_wall = now_wall + float(merge_every_sec)
+            # 次の処理フレームへスキップ（高速化）
+            if stride_frames > 1:
+                next_pos = frame_idx + (stride_frames - 1)
+                if next_pos < total_frames:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, next_pos)
+                    frame_idx = next_pos
     finally:
         csv_file.close()
         cap.release()
@@ -1032,6 +1049,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--flush-every-n", type=int, default=30, help="CSVフラッシュの間隔（フレーム数、30で30フレーム毎）")
     p.add_argument("--no-merge", action="store_true", help="マージ処理を完全に無効化")
     p.add_argument("--run-id", default=None, help="出力run名に付与する任意ID")
+    p.add_argument("--process-fps", type=float, default=0.0, help="1秒あたりの処理フレーム数（0で全フレーム）")
     return p.parse_args()
 
 
@@ -1074,6 +1092,7 @@ def main() -> None:
         flush_every_n=args.flush_every_n,
         no_merge=args.no_merge,
         run_id=args.run_id,
+        process_fps=args.process_fps,
     )
 
 
