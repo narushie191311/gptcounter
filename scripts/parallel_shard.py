@@ -43,6 +43,14 @@ def main() -> None:
     total_sec = (total_frames / fps) if total_frames > 0 else 0.0
     cap.release()
 
+    # paths prepared before auto-shard warmup uses them
+    video_id = sanitize(os.path.splitext(os.path.basename(args.video))[0])
+    base_name = os.path.splitext(os.path.basename(args.base_output))[0]
+    out_dir = os.path.dirname(args.base_output) or "outputs"
+    os.makedirs(out_dir, exist_ok=True)
+    work_dir = os.path.join(out_dir, f"parallel_{video_id}")
+    os.makedirs(work_dir, exist_ok=True)
+
     # auto decide shards
     shards = int(args.shards)
     if shards <= 0:
@@ -88,13 +96,6 @@ def main() -> None:
             pass
     shards = max(1, shards)
     per_sec = total_sec / shards if total_sec > 0 else 0
-
-    video_id = sanitize(os.path.splitext(os.path.basename(args.video))[0])
-    base_name = os.path.splitext(os.path.basename(args.base_output))[0]
-    out_dir = os.path.dirname(args.base_output) or "outputs"
-    os.makedirs(out_dir, exist_ok=True)
-    work_dir = os.path.join(out_dir, f"parallel_{video_id}")
-    os.makedirs(work_dir, exist_ok=True)
 
     jobs = []
     for i in range(shards):
