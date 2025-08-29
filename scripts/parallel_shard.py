@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from typing import List, Optional, Tuple
 
 import cv2
@@ -20,9 +21,69 @@ def sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:100]
 
 
-def run_proc(cmd: List[str], env: Optional[dict] = None, cwd: Optional[str] = None) -> int:
-    p = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, env=env, cwd=cwd)
-    return p.wait()
+def run_proc_streaming(
+    cmd: List[str],
+    env: Optional[dict] = None,
+    cwd: Optional[str] = None,
+    per_chunk_timeout_sec: float = 0.0,
+) -> int:
+    """Run a child analyzer, stream logs to parent, and enforce optional timeout.
+
+    - Streams stdout/stderr to parent's stdout in real time
+    - If per_chunk_timeout_sec > 0, kill process when exceeded
+    """
+    p = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        cwd=cwd,
+        bufsize=1,
+        universal_newlines=True,
+    )
+
+    def _pump():
+        assert p.stdout is not None
+        for line in iter(p.stdout.readline, ""):
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+    t0 = time.time()
+    t = threading.Thread(target=_pump, daemon=True)
+    t.start()
+    rc = None
+    try:
+        while True:
+            rc = p.poll()
+            if rc is not None:
+                break
+            if per_chunk_timeout_sec and per_chunk_timeout_sec > 0.0:
+                if (time.time() - t0) > per_chunk_timeout_sec:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    rc = 124  # timeout
+                    break
+            time.sleep(0.5)
+    finally:
+        try:
+            if p.stdout is not None:
+                try:
+                    p.stdout.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    # Wait a moment for the pump thread to finish printing
+    try:
+        t.join(timeout=1.0)
+    except Exception:
+        pass
+    return int(rc if rc is not None else 1)
 
 
 def main() -> None:
@@ -40,6 +101,8 @@ def main() -> None:
     ap.add_argument("--procs-per-gpu", type=int, default=1, help="parallel processes per GPU")
     ap.add_argument("--skip-existing", type=int, default=1, help="skip chunks already written (1=yes,0=no)")
     ap.add_argument("--online-merge", type=int, default=1, help="enable analyzer online merge (1) or disable (0)")
+    ap.add_argument("--per-chunk-timeout-sec", type=float, default=0.0, help="kill a chunk if it exceeds this wall time (0=disable)")
+    ap.add_argument("--prewarm-sec", type=float, default=2.0, help="run a short single analyzer to pre-download models (0=disable)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -83,7 +146,9 @@ def main() -> None:
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
         t0 = time.time()
-        run_proc(cmd, cwd=project_root)
+        run_rc = run_proc_streaming(cmd, cwd=project_root, per_chunk_timeout_sec=max(30.0, sample_sec * 10))
+        if run_rc != 0:
+            print(f"[WARMUP] non-zero return code={run_rc}")
         t1 = time.time()
         warm_speed = (sample_sec / max(1e-3, (t1 - t0)))  # video seconds per wall second
         # estimate needed parallelism
@@ -108,6 +173,30 @@ def main() -> None:
         except Exception:
             pass
     shards = max(1, shards)
+
+    # optional prewarm to avoid model downloads by each child
+    if args.prewarm_sec and args.prewarm_sec > 0.0:
+        tmp_out = os.path.join(out_dir, f"{base_name}_prewarm.csv")
+        cmd = [
+            sys.executable,
+            analyzer_path,
+            "--video", args.video,
+            "--start-sec", "0",
+            "--duration-sec", str(max(0.5, float(args.prewarm_sec))),
+            "--output-csv", tmp_out,
+            "--no-show", "--device", "cuda",
+        ]
+        if int(args.online_merge) == 0:
+            cmd += ["--no-merge", "--merge-every-sec", "0"]
+        if args.extra_args.strip():
+            cmd += args.extra_args.strip().split()
+        print("[PREWARM] starting a short run to pre-download models and warm caches...")
+        _ = run_proc_streaming(cmd, cwd=project_root, per_chunk_timeout_sec=max(60.0, float(args.prewarm_sec) * 20))
+        try:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except Exception:
+            pass
     per_sec = total_sec / shards if total_sec > 0 else 0
 
     # GPU assignment (multi-GPU optional)
@@ -237,22 +326,36 @@ def main() -> None:
         if gpu_env is not None:
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = gpu_env
+        if env is None:
+            env = os.environ.copy()
+        # safety envs to avoid TRT/CUDA provider conflicts and reduce spam
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        env.setdefault("ORT_DISABLE_TENSORRT", "1")
+        env.setdefault("DISABLE_TRT_EXPORT", "1")
+        env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+        env.setdefault("CUDA_MODULE_LOADING", "LAZY")
+        env.setdefault("INSIGHTFACE_HOME", str(Path(project_root) / "models_insightface"))
         return cmd, env
 
     # スレッドプールでワークキューを消化（速いワーカーが遅いチャンクを自動的に担当）
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = []
-        for i, (s, d, op) in enumerate(chunks):
-            # GPUをラウンドロビン割り当て
-            gpu_env = None
-            if gpu_ids:
-                gpu_env = gpu_ids[i % len(gpu_ids)]
-            cmd, env = make_cmd(s, d, op, gpu_env)
-            dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
-            print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
-            futs.append(ex.submit(run_proc, cmd, env, project_root))
-        for fut in as_completed(futs):
-            rcodes.append(fut.result())
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = []
+            for i, (s, d, op) in enumerate(chunks):
+                # GPUをラウンドロビン割り当て
+                gpu_env = None
+                if gpu_ids:
+                    gpu_env = gpu_ids[i % len(gpu_ids)]
+                cmd, env = make_cmd(s, d, op, gpu_env)
+                dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
+                print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
+                futs.append(ex.submit(run_proc_streaming, cmd, env, project_root, float(args.per_chunk_timeout_sec)))
+            for fut in as_completed(futs):
+                rcodes.append(fut.result())
+    except KeyboardInterrupt:
+        print("\n[PARALLEL] KeyboardInterrupt received. Waiting for running tasks to terminate...")
+        # The streaming function will exit when processes are killed by the environment/user.
+        raise
     if any(r != 0 for r in rcodes):
         raise SystemExit(f"some shards failed: {rcodes}")
 
