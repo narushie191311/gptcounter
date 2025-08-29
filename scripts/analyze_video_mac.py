@@ -93,18 +93,6 @@ def init_person_detector(device: str = "auto") -> YOLO:
     try:
         if use_cuda:
             model.to("cuda")
-            # FP16で高速化（A100推奨）
-            try:
-                if hasattr(model, "model"):
-                    model.model.half()
-            except Exception:
-                pass
-        # 推論最適化
-        try:
-            if hasattr(model, "fuse"):
-                model.fuse()
-        except Exception:
-            pass
     except Exception:
         pass
     return model
