@@ -518,8 +518,32 @@ def analyze_video(
     # 動画の全体長を計算（秒）
     total_video_duration = total_frames / fps if total_frames > 0 and fps > 0 else 0
 
+    # 出力先とレジューム対象の事前判定（latestリンクを優先）
+    out_dir = os.path.dirname(output_csv) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    dir_basename = os.path.basename(os.path.normpath(out_dir))
+    default_outputs_dir = (dir_basename == "outputs")
+    latest_link = os.path.join(out_dir, os.path.splitext(os.path.basename(output_csv))[0] + "_latest.csv")
+    resume_mode = False
+    resume_csv_path: Optional[str] = None
+    last_written_frame: Optional[int] = None
+    if default_outputs_dir and os.path.exists(latest_link) and bool(os.environ.get("ALLOW_RESUME", "1")):
+        try:
+            candidate = os.path.realpath(latest_link)
+            with open(candidate, newline="") as rf:
+                rr = csv.DictReader(rf)
+                for row in rr:
+                    try:
+                        last_written_frame = int(str(row.get("frame", "0").strip() or "0"))
+                    except Exception:
+                        pass
+            if last_written_frame is not None and last_written_frame > 0:
+                resume_mode = True
+                resume_csv_path = candidate
+        except Exception:
+            resume_mode = False
+
     # シーク（時間単位で試して、失敗したらフレーム単位）
-    # レジューム時は最後に書かれたフレームへシーク
     if resume_mode and (last_written_frame is not None) and last_written_frame > 0:
         target_frame = int(last_written_frame)
         start_sec = float(target_frame) / float(fps)
@@ -550,10 +574,9 @@ def analyze_video(
     _ensure_dir(run_dir)
 
     # 出力CSVはデフォルトで衝突しないよう run_dir 配下へ
-    # （ユーザーがoutputs配下に置く場合は自動で一意化。明示的に別ディレクトリを指定した場合は尊重）
     dir_basename = os.path.basename(os.path.normpath(out_dir))
     default_outputs_dir = (dir_basename == "outputs")
-    unique_output = True  # 既定で一意化
+    unique_output = True
     effective_csv_path = (
         os.path.join(run_dir, os.path.basename(output_csv))
         if (unique_output and default_outputs_dir)
@@ -570,29 +593,33 @@ def analyze_video(
                     pass
             os.symlink(os.path.abspath(effective_csv_path), latest_link)
         except Exception:
-            # シンボリックリンクが使えない環境では無視
             pass
 
-    # レジューム設定
+    # レジューム設定（latestリンクを優先、無ければeffective_csv_path）
     resume_mode = False
     last_written_frame: Optional[int] = None
-    if os.path.exists(effective_csv_path) and not no_merge:
-        # 既存ファイルがあり、明示的に --no-merge ではない場合は通常運用として新規出力を推奨
-        pass
-    if os.path.exists(effective_csv_path) and bool(os.environ.get("ALLOW_RESUME", "1")):
-        # 既存CSVがあれば末尾フレームを参照して追記レジューム
-        try:
-            with open(effective_csv_path, newline="") as rf:
-                rr = csv.DictReader(rf)
-                for row in rr:
-                    try:
-                        last_written_frame = int(str(row.get("frame", "0").strip() or "0"))
-                    except Exception:
-                        pass
-            if last_written_frame is not None:
-                resume_mode = True
-        except Exception:
-            resume_mode = False
+    candidate_csvs = []
+    latest_link = os.path.join(out_dir, os.path.splitext(os.path.basename(output_csv))[0] + "_latest.csv")
+    if os.path.exists(latest_link):
+        candidate_csvs.append(os.path.realpath(latest_link))
+    if os.path.exists(effective_csv_path):
+        candidate_csvs.append(effective_csv_path)
+    if bool(os.environ.get("ALLOW_RESUME", "1")):
+        for cand in candidate_csvs:
+            try:
+                with open(cand, newline="") as rf:
+                    rr = csv.DictReader(rf)
+                    for row in rr:
+                        try:
+                            last_written_frame = int(str(row.get("frame", "0").strip() or "0"))
+                        except Exception:
+                            pass
+                if last_written_frame is not None and last_written_frame > 0:
+                    resume_mode = True
+                    effective_csv_path = cand  # 継続して追記
+                    break
+            except Exception:
+                continue
 
     csv_file = open(effective_csv_path, ("a" if resume_mode else "w"), newline="")
     writer = csv.writer(csv_file)
