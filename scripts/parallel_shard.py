@@ -103,6 +103,8 @@ def main() -> None:
     ap.add_argument("--online-merge", type=int, default=1, help="enable analyzer online merge (1) or disable (0)")
     ap.add_argument("--per-chunk-timeout-sec", type=float, default=0.0, help="kill a chunk if it exceeds this wall time (0=disable)")
     ap.add_argument("--prewarm-sec", type=float, default=2.0, help="run a short single analyzer to pre-download models (0=disable)")
+    ap.add_argument("--save-raw", type=int, default=1, help="also save per-chunk raw CSV via --output-csv-raw (1=yes,0=no)")
+    ap.add_argument("--raw-dir", default="", help="directory to store per-chunk raw CSVs (default=work_dir)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -322,6 +324,14 @@ def main() -> None:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
+        # add per-chunk raw output unless user already set it in extra-args
+        if int(args.save_raw) == 1:
+            extra_joined = " ".join(cmd)
+            if "--output-csv-raw" not in extra_joined:
+                raw_dir = args.raw_dir.strip() or work_dir
+                os.makedirs(raw_dir, exist_ok=True)
+                raw_path = os.path.join(raw_dir, f"{base_name}_chunk_{int(start_s)}s_raw.csv")
+                cmd += ["--output-csv-raw", raw_path]
         env = None
         if gpu_env is not None:
             env = os.environ.copy()
