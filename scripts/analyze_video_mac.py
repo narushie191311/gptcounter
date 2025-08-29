@@ -519,9 +519,14 @@ def analyze_video(
     total_video_duration = total_frames / fps if total_frames > 0 and fps > 0 else 0
 
     # シーク（時間単位で試して、失敗したらフレーム単位）
-    cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
-    # 一部のコーデックでは MSEC が効かないため冗長に設定
-    target_frame = int(round(start_sec * fps))
+    # レジューム時は最後に書かれたフレームへシーク
+    if resume_mode and (last_written_frame is not None) and last_written_frame > 0:
+        target_frame = int(last_written_frame)
+        start_sec = float(target_frame) / float(fps)
+    else:
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
+        # 一部のコーデックでは MSEC が効かないため冗長に設定
+        target_frame = int(round(start_sec * fps))
     cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
     start_frame_pos = target_frame
 
@@ -568,30 +573,52 @@ def analyze_video(
             # シンボリックリンクが使えない環境では無視
             pass
 
-    csv_file = open(effective_csv_path, "w", newline="")
+    # レジューム設定
+    resume_mode = False
+    last_written_frame: Optional[int] = None
+    if os.path.exists(effective_csv_path) and not no_merge:
+        # 既存ファイルがあり、明示的に --no-merge ではない場合は通常運用として新規出力を推奨
+        pass
+    if os.path.exists(effective_csv_path) and bool(os.environ.get("ALLOW_RESUME", "1")):
+        # 既存CSVがあれば末尾フレームを参照して追記レジューム
+        try:
+            with open(effective_csv_path, newline="") as rf:
+                rr = csv.DictReader(rf)
+                for row in rr:
+                    try:
+                        last_written_frame = int(str(row.get("frame", "0").strip() or "0"))
+                    except Exception:
+                        pass
+            if last_written_frame is not None:
+                resume_mode = True
+        except Exception:
+            resume_mode = False
+
+    csv_file = open(effective_csv_path, ("a" if resume_mode else "w"), newline="")
     writer = csv.writer(csv_file)
     # 実行開始時刻（JST）を列に保持（各行に同値を書き込む）
     run_started_utc = datetime.now(timezone.utc)
     run_started_jst_dt = run_started_utc.astimezone(ZoneInfo("Asia/Tokyo")) if ZoneInfo else run_started_utc
     run_started_jst_str = run_started_jst_dt.strftime("%Y-%m-%d %H:%M:%S")
     # 列: timestamp(開始秒からの相対) の隣に、動画ファイル開始(例: 11:41:00)からの相対時刻を追加
-    writer.writerow([
-        "timestamp",  # start_sec からの相対 HH:MM:SS
-        "ts_from_file_start",  # 動画ファイル開始(例: 11:41:00)からの相対 HH:MM:SS
-        "frame",
-        "person_id",
-        "track_id",
-        "age",
-        "gender",
-        "x",
-        "y",
-        "w",
-        "h",
-        "conf",
-        "embedding_b64",
-        "absolute_timestamp",
-        "run_started_jst",
-    ])
+    if not resume_mode:
+        writer.writerow([
+            "timestamp",  # start_sec からの相対 HH:MM:SS
+            "ts_from_file_start",  # 動画ファイル開始(例: 11:41:00)からの相対 HH:MM:SS
+            "frame",
+            "person_id",
+            "track_id",
+            "age",
+            "gender",
+            "x",
+            "y",
+            "w",
+            "h",
+            "conf",
+            "embedding_b64",
+            "absolute_timestamp",
+            "run_started_jst",
+        ])
 
     # 絶対開始時刻（JST）をファイル名から推定
     video_dt = parse_video_start_datetime(video_path)
@@ -612,6 +639,13 @@ def analyze_video(
     next_log_wall = start_wall + float(log_every_sec)
     next_ckpt_wall = start_wall + float(checkpoint_every_sec)
     next_merge_wall = start_wall + float(merge_every_sec) if merge_every_sec and merge_every_sec > 0 else float("inf")
+    # 自動調整: 目標ウォール時間（分）
+    target_wall_min = float(os.environ.get("TARGET_WALL_MIN", "0"))
+    # 起動後のウォームアップ区間（秒）
+    autotune_warmup_sec = float(os.environ.get("AUTOTUNE_WARMUP_SEC", "30"))
+    last_autotune_wall = start_wall
+    # 現在の process_fps 推定
+    current_process_fps = float(process_fps or 0.0)
     
     # 開始時のログ出力
     if video_dt is not None:
@@ -1007,6 +1041,29 @@ def analyze_video(
             if now_wall >= next_merge_wall:
                 threading.Thread(target=launch_merge_snapshot, daemon=True).start()
                 next_merge_wall = now_wall + float(merge_every_sec)
+
+            # オートチューニング: 目標時間に合わせて stride_frames を調整
+            if target_wall_min and target_wall_min > 0 and (now_wall - start_wall) > autotune_warmup_sec and (now_wall - last_autotune_wall) > max(autotune_warmup_sec, 20):
+                elapsed = now_wall - start_wall
+                processed_frames = max(1, frame_idx - start_frame_pos)
+                # 実測処理速度（frames/sec）
+                fps_proc = processed_frames / elapsed
+                remaining_frames = max(0, (total_frames - frame_idx))
+                eta_sec_frames = remaining_frames / max(fps_proc, 1e-6)
+                target_total_sec = float(target_wall_min) * 60.0
+                remaining_target = max(1.0, target_total_sec - elapsed)
+                # 目標に合わせるための必要間引率（単純比）
+                scale = eta_sec_frames / remaining_target
+                # scale > 1 なら間引きを強め、< 1 なら緩める
+                if scale > 1.05 or scale < 0.95:
+                    new_stride = stride_frames
+                    if scale > 1.05:
+                        new_stride = min(stride_frames * 2, int(fps))
+                    elif scale < 0.95 and stride_frames > 1:
+                        new_stride = max(1, stride_frames // 2)
+                    if new_stride != stride_frames:
+                        stride_frames = new_stride
+                        last_autotune_wall = now_wall
             # 次の処理フレームへスキップ（高速化）
             if stride_frames > 1:
                 next_pos = frame_idx + (stride_frames - 1)
