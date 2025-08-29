@@ -171,8 +171,13 @@ class UltimateParallelProcessor:
         
         try:
             # 絶対パス + 固定cwdで実行（相対パス問題を回避）
+            # TensorRT初期化競合の回避（ONNXRuntimeのTRT EPを無効化）
+            env = os.environ.copy()
+            env.setdefault("ORT_DISABLE_TENSORRT", "1")
+            env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+            env.setdefault("INSIGHTFACE_HOME", str(self.project_root / "models_insightface" / "models"))
             result = subprocess.run(
-                cmd, cwd=str(self.project_root), capture_output=True, text=True
+                cmd, cwd=str(self.project_root), capture_output=True, text=True, env=env
             )
             if result.returncode == 0:
                 print(f"✓ チャンク {chunk_id} 完了")
@@ -325,6 +330,11 @@ class UltimateParallelProcessor:
                     successful_chunks.append(output_csv)
                     self.chunk_results.append((True, chunk_id, output_csv))
                     completed_secs += chunk_id_to_sec.get(chunk_id, 0.0)
+                    # 部分マージを逐次実施（中断再開用のグローバルCSVを更新）
+                    try:
+                        self._merge_chunks(successful_chunks, self.output_csv)
+                    except Exception as e:
+                        print(f"部分マージに失敗（継続）: {e}")
                 else:
                     # 失敗でもETA計算に含めない
                     pass
