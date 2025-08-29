@@ -582,15 +582,25 @@ def analyze_video(
     dir_basename = os.path.basename(os.path.normpath(out_dir))
     default_outputs_dir = (dir_basename == "outputs")
     unique_output = True
+    # 実行元の動画ファイル名をサフィックスとして付与（並行実行での衝突回避）
+    try:
+        base_out = os.path.splitext(os.path.basename(output_csv))[0]
+        video_base = os.path.splitext(os.path.basename(video_path))[0]
+        import re as _re
+        video_id = _re.sub(r"[^A-Za-z0-9_.-]", "_", video_base)[:80]
+        csv_name_with_video = f"{base_out}_{video_id}.csv"
+    except Exception:
+        csv_name_with_video = os.path.basename(output_csv)
     effective_csv_path = (
-        os.path.join(run_dir, os.path.basename(output_csv))
+        os.path.join(run_dir, csv_name_with_video)
         if (unique_output and default_outputs_dir)
         else output_csv
     )
     # 便利リンク: 最新CSVへのシンボリックリンクを outputs に作成
     if unique_output and default_outputs_dir:
         try:
-            latest_link = os.path.join(out_dir, os.path.splitext(os.path.basename(output_csv))[0] + "_latest.csv")
+            base_out = os.path.splitext(os.path.basename(output_csv))[0]
+            latest_link = os.path.join(out_dir, f"{base_out}_{video_id}_latest.csv")
             if os.path.islink(latest_link) or os.path.exists(latest_link):
                 try:
                     os.remove(latest_link)
@@ -604,9 +614,13 @@ def analyze_video(
     resume_mode = False
     last_written_frame: Optional[int] = None
     candidate_csvs = []
-    latest_link = os.path.join(out_dir, os.path.splitext(os.path.basename(output_csv))[0] + "_latest.csv")
-    if os.path.exists(latest_link):
-        candidate_csvs.append(os.path.realpath(latest_link))
+    try:
+        base_out = os.path.splitext(os.path.basename(output_csv))[0]
+        _resume_latest = os.path.join(out_dir, f"{base_out}_{video_id}_latest.csv")
+    except Exception:
+        _resume_latest = os.path.join(out_dir, os.path.splitext(os.path.basename(output_csv))[0] + "_latest.csv")
+    if os.path.exists(_resume_latest):
+        candidate_csvs.append(os.path.realpath(_resume_latest))
     if os.path.exists(effective_csv_path):
         candidate_csvs.append(effective_csv_path)
     if bool(os.environ.get("ALLOW_RESUME", "1")):
