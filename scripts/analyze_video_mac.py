@@ -225,6 +225,9 @@ def detect_person_boxes(
     if use_half:
         predict_kwargs["half"] = True
     try:
+        # heavy but more stable: increase overlap/augment for recall if large faces
+        if imgsz and imgsz >= 1280:
+            predict_kwargs["overlap"] = 0.7
         results = yolo.predict(**predict_kwargs)
     except TypeError:
         # half引数が未対応な古いバージョンへのフォールバック
@@ -379,6 +382,11 @@ class Track:
     person_id: Optional[int] = None
     embedding: Optional[np.ndarray] = None
     embedding_count: int = 0
+    # Robust aggregation accumulators
+    age_wsum: float = 0.0
+    age_w: float = 0.0
+    gender_psum: float = 0.0  # probability of Female
+    gender_w: float = 0.0
 
 
 class PersonRegistry:
@@ -387,6 +395,8 @@ class PersonRegistry:
         self.next_person_id = 1
         self.person_id_to_embedding: Dict[int, np.ndarray] = {}
         self.person_id_to_count: Dict[int, int] = {}
+        # temporal memory of best-quality snapshots per person
+        self.person_id_to_best: Dict[int, Tuple[np.ndarray, float]] = {}
 
     @staticmethod
     def _cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -1203,6 +1213,9 @@ def analyze_video(
 
             if tracker_backend == "embed":
                 det_embs = [e for (_, _, e) in det_attrs]
+                # tighten gating to reduce ID switches (more conservative matching)
+                tracker.iou_gate = 0.25
+                tracker.sim_gate = 0.45
                 tracks = tracker.update(boxes, det_embs, frame_idx, det_weights=det_quality_weights)
             else:
                 # 外部トラッカー: person_boxesからのトラッキング
@@ -1246,8 +1259,19 @@ def analyze_video(
                         best_i, best_idx = val, idx
                 if best_idx is not None and best_idx < len(det_attrs):
                     age, gender, emb = det_attrs[best_idx]
-                    tr.age = age
-                    tr.gender = gender
+                    # robust, quality-weighted temporal aggregation
+                    w = float(det_quality_weights[best_idx])
+                    if isinstance(age, (int, float)) and age > 0:
+                        tr.age_wsum += float(age) * w
+                        tr.age_w += w
+                        tr.age = int(round(tr.age_wsum / max(tr.age_w, 1e-6)))
+                    # map gender to prob(Female)
+                    if isinstance(gender, str) and gender:
+                        p_f = 1.0 if gender.lower().startswith("f") else 0.0
+                        tr.gender_psum += p_f * w
+                        tr.gender_w += w
+                        p = tr.gender_psum / max(tr.gender_w, 1e-6)
+                        tr.gender = "Female" if p >= 0.5 else "Male"
                     if tracker_backend != "embed":
                         if emb is not None:
                             mem = ext_attr.setdefault(tr.track_id, {"emb": None, "cnt": 0, "age": None, "gender": None})
