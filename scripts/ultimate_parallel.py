@@ -29,12 +29,25 @@ class UltimateParallelProcessor:
         self.output_dir = str(output_dir or "outputs")
         self.chunks_dir = str(Path(self.output_dir) / "chunks")
         Path(self.chunks_dir).mkdir(parents=True, exist_ok=True)
+        self.logs_dir = str(Path(self.output_dir) / "logs")
+        Path(self.logs_dir).mkdir(parents=True, exist_ok=True)
         self.output_csv = output_csv or str(Path(self.output_dir) / "ultimate_merged_analysis.csv")
         self.start_time = None
         self.chunk_results = []
         self.resume_file = str(Path(self.output_dir) / "parallel_resume_state.json")
         # プロジェクトルート（/content/gptcounter のようなディレクトリ）
         self.project_root = Path(__file__).resolve().parent.parent
+        # 並列度（GPU数に応じて自動抑制）
+        self.pool_procs = min(self.num_chunks, mp.cpu_count())
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_count = torch.cuda.device_count()
+                # 単一GPUならデフォルト4、本数 * 4 まで
+                suggested = max(2, gpu_count * 4)
+                self.pool_procs = min(self.pool_procs, suggested)
+        except Exception:
+            pass
         
         # 設定読み込み（複数パスから検索）
         self.configs = self._load_config()
@@ -181,15 +194,21 @@ class UltimateParallelProcessor:
             )
             if result.returncode == 0:
                 print(f"✓ チャンク {chunk_id} 完了")
-                if result.stdout:
-                    print(result.stdout[:500])
+                # ログ保存
+                try:
+                    (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.out").write_text(result.stdout or "")
+                    (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.err").write_text(result.stderr or "")
+                except Exception:
+                    pass
                 return True, chunk_id, output_csv
             else:
                 print(f"✗ チャンク {chunk_id} 失敗 (code={result.returncode})")
-                if result.stdout:
-                    print(f"[stdout]\n{result.stdout[:1000]}")
-                if result.stderr:
-                    print(f"[stderr]\n{result.stderr[:2000]}")
+                # ログ保存
+                try:
+                    (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.out").write_text(result.stdout or "")
+                    (Path(self.logs_dir) / f"chunk_{chunk_id:03d}.err").write_text(result.stderr or "")
+                except Exception:
+                    pass
                 return False, chunk_id, None
         except Exception as e:
             print(f"✗ チャンク {chunk_id} エラー: {e}")
@@ -324,7 +343,7 @@ class UltimateParallelProcessor:
         # モデルの事前ダウンロード（InsightFaceなど）
         self._ensure_models_downloaded()
         
-        with mp.Pool(processes=min(self.num_chunks, mp.cpu_count())) as pool:
+        with mp.Pool(processes=self.pool_procs) as pool:
             for success, chunk_id, output_csv in pool.imap_unordered(self.process_chunk_with_monitoring, chunks_to_process):
                 if success:
                     successful_chunks.append(output_csv)
@@ -477,6 +496,7 @@ def main():
     parser.add_argument("--eta-target", type=float, help="目標処理時間（秒）")
     parser.add_argument("--output-dir", help="出力ベースディレクトリ（既定: outputs）")
     parser.add_argument("--output-csv", help="マージ後の最終CSVファイルパス（既定: <output-dir>/ultimate_merged_analysis.csv）")
+    parser.add_argument("--pool-procs", type=int, help="並列プロセス数を明示指定（未指定時は自動）")
     
     args = parser.parse_args()
     
@@ -488,6 +508,8 @@ def main():
         output_csv=args.output_csv,
         output_dir=args.output_dir,
     )
+    if args.pool_procs:
+        processor.pool_procs = max(1, min(args.pool_procs, mp.cpu_count()))
     success = processor.execute_with_eta_control()
     
     sys.exit(0 if success else 1)
