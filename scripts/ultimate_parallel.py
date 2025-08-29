@@ -18,15 +18,18 @@ import GPUtil
 import signal
 
 class UltimateParallelProcessor:
-    def __init__(self, video_path, num_chunks, config_name, eta_target=None, output_csv=None):
+    def __init__(self, video_path, num_chunks, config_name, eta_target=None, output_csv=None, output_dir=None):
         self.video_path = video_path
         self.num_chunks = num_chunks
         self.config_name = config_name
         self.eta_target = eta_target
-        self.output_csv = output_csv or "outputs/ultimate_merged_analysis.csv"
+        self.output_dir = str(output_dir or "outputs")
+        self.chunks_dir = str(Path(self.output_dir) / "chunks")
+        Path(self.chunks_dir).mkdir(parents=True, exist_ok=True)
+        self.output_csv = output_csv or str(Path(self.output_dir) / "ultimate_merged_analysis.csv")
         self.start_time = None
         self.chunk_results = []
-        self.resume_file = "outputs/parallel_resume_state.json"
+        self.resume_file = str(Path(self.output_dir) / "parallel_resume_state.json")
         
         # 設定読み込み（複数パスから検索）
         self.configs = self._load_config()
@@ -157,8 +160,8 @@ class UltimateParallelProcessor:
         # GPU使用率監視
         gpu_monitor = GPUMonitor()
         
-        output_csv = f"outputs/chunks/chunk_{chunk_id:03d}.csv"
-        output_video = f"outputs/chunks/chunk_{chunk_id:03d}.mp4"
+        output_csv = f"{self.chunks_dir}/chunk_{chunk_id:03d}.csv"
+        output_video = f"{self.chunks_dir}/chunk_{chunk_id:03d}.mp4"
         
         cmd = self._build_chunk_command(chunk_id, start_sec, duration_sec, output_csv, output_video)
         
@@ -236,7 +239,7 @@ class UltimateParallelProcessor:
           --video "{self.video_path}" \\
           --start-sec {start_sec} \\
           --duration-sec {duration_sec} \\
-          --output-csv outputs/chunks/chunk_{chunk_id:03d}_light.csv \\
+          --output-csv {self.chunks_dir}/chunk_{chunk_id:03d}_light.csv \\
           --device cuda \\
           --yolo-weights {light_config['yolo_weights']} \\
           --det-size {light_config['det_size']} \\
@@ -247,7 +250,7 @@ class UltimateParallelProcessor:
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
                 print(f"✓ チャンク {chunk_id} 軽量設定で完了")
-                return True, chunk_id, f"outputs/chunks/chunk_{chunk_id:03d}_light.csv"
+                return True, chunk_id, f"{self.chunks_dir}/chunk_{chunk_id:03d}_light.csv"
             else:
                 return False, chunk_id, None
         except:
@@ -290,7 +293,7 @@ class UltimateParallelProcessor:
             chunks = self._create_chunks(video_info['total_duration'])
             
             # 出力ディレクトリ作成
-            Path("outputs/chunks").mkdir(parents=True, exist_ok=True)
+            Path(self.chunks_dir).mkdir(parents=True, exist_ok=True)
         
         # 並列処理実行
         print(f"究極性能並列処理開始: {self.num_chunks} チャンク")
@@ -326,17 +329,46 @@ class UltimateParallelProcessor:
     
     def _get_video_info(self):
         """動画情報を取得"""
+        # パス存在確認
+        if not os.path.exists(self.video_path):
+            print(f"✗ 動画ファイルが見つかりません: {self.video_path}")
+            return None
+        # まずOpenCVで取得
         try:
             import cv2
             cap = cv2.VideoCapture(self.video_path)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            total_duration = total_frames / fps
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if fps > 0 and total_frames > 0:
+                total_duration = total_frames / fps
+                cap.release()
+                return {"total_frames": total_frames, "fps": fps, "total_duration": total_duration}
             cap.release()
-            return {"total_frames": total_frames, "fps": fps, "total_duration": total_duration}
-        except:
-            print("動画情報の取得に失敗")
-            return None
+        except Exception as e:
+            print(f"OpenCVでの取得に失敗: {e}")
+        # PyAVでフォールバック
+        try:
+            import av
+            with av.open(self.video_path) as container:
+                stream = next((s for s in container.streams if s.type == 'video'), None)
+                if stream is None:
+                    print("✗ PyAV: ビデオストリームが見つかりません")
+                    return None
+                # durationはマイクロ秒単位のことが多い
+                if container.duration:
+                    total_duration = container.duration / 1e6
+                elif stream.duration and stream.time_base:
+                    total_duration = float(stream.duration * float(stream.time_base))
+                else:
+                    total_duration = 0.0
+                fps = float(stream.average_rate) if stream.average_rate else 0.0
+                total_frames = int(total_duration * fps) if fps > 0 and total_duration > 0 else 0
+                if total_duration > 0 and fps > 0:
+                    return {"total_frames": total_frames, "fps": fps, "total_duration": total_duration}
+        except Exception as e:
+            print(f"PyAVでの取得に失敗: {e}")
+        print("動画情報の取得に失敗")
+        return None
     
     def _create_chunks(self, total_duration):
         """チャンク分割"""
