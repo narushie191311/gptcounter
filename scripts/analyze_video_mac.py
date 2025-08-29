@@ -562,7 +562,28 @@ def analyze_video(
 
     csv_file = open(effective_csv_path, "w", newline="")
     writer = csv.writer(csv_file)
-    writer.writerow(["timestamp", "frame", "person_id", "track_id", "age", "gender", "x", "y", "w", "h", "conf", "embedding_b64", "absolute_timestamp"])
+    # 実行開始時刻（JST）を列に保持（各行に同値を書き込む）
+    run_started_utc = datetime.now(timezone.utc)
+    run_started_jst_dt = run_started_utc.astimezone(ZoneInfo("Asia/Tokyo")) if ZoneInfo else run_started_utc
+    run_started_jst_str = run_started_jst_dt.strftime("%Y-%m-%d %H:%M:%S")
+    # 列: timestamp(開始秒からの相対) の隣に、動画ファイル開始(例: 11:41:00)からの相対時刻を追加
+    writer.writerow([
+        "timestamp",  # start_sec からの相対 HH:MM:SS
+        "ts_from_file_start",  # 動画ファイル開始(例: 11:41:00)からの相対 HH:MM:SS
+        "frame",
+        "person_id",
+        "track_id",
+        "age",
+        "gender",
+        "x",
+        "y",
+        "w",
+        "h",
+        "conf",
+        "embedding_b64",
+        "absolute_timestamp",
+        "run_started_jst",
+    ])
 
     # 絶対開始時刻（JST）をファイル名から推定
     video_dt = parse_video_start_datetime(video_path)
@@ -910,10 +931,24 @@ def analyze_video(
                     except Exception:
                         emb_b64 = ""
                 ts_out = abs_ts if abs_ts else ts_str
+                # 動画ファイル開始からの相対（start_secを引かない）
+                ts_from_file_start = format_timestamp(current_time_sec)
                 writer.writerow([
-                    ts_str, frame_idx, tr.person_id if tr.person_id is not None else tr.track_id, tr.track_id,
-                    tr.age if tr.age is not None else "", tr.gender if tr.gender is not None else "",
-                    x, y, w, h, f"{conf_val:.3f}", emb_b64, abs_ts
+                    ts_str,
+                    ts_from_file_start,
+                    frame_idx,
+                    tr.person_id if tr.person_id is not None else tr.track_id,
+                    tr.track_id,
+                    tr.age if tr.age is not None else "",
+                    tr.gender if tr.gender is not None else "",
+                    x,
+                    y,
+                    w,
+                    h,
+                    f"{conf_val:.3f}",
+                    emb_b64,
+                    abs_ts,
+                    run_started_jst_str,
                 ])
             
             # フレーム処理後にCSVをフラッシュ（データ損失防止）
