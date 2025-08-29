@@ -129,8 +129,13 @@ def merge_persons_by_embedding(df_person: pd.DataFrame, emb_thresh: float, overl
 def summarize(input_csv: str, video_path: str, output_csv: str, emb_merge: bool, emb_thresh: float, overlap_veto_sec: float,
               stats_out: Optional[str] = None, merge_max_dist_px: Optional[float] = None, cluster_from: str = "person") -> str:
     df = pd.read_csv(input_csv)
-    has_person = "person_id" in df.columns
-    pid_col = "person_id" if has_person else "track_id"
+    # 4000人マージ後のCSVには merged_person_id が含まれる想定
+    if "merged_person_id" in df.columns:
+        pid_col = "merged_person_id"
+    elif "person_id" in df.columns:
+        pid_col = "person_id"
+    else:
+        pid_col = "track_id"
 
     # parse video start
     start_dt = parse_video_start_datetime(video_path)
