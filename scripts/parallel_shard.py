@@ -39,6 +39,7 @@ def main() -> None:
     ap.add_argument("--gpus", default="", help="comma-separated GPU ids for multi-GPU (e.g., 0,1)")
     ap.add_argument("--procs-per-gpu", type=int, default=1, help="parallel processes per GPU")
     ap.add_argument("--skip-existing", type=int, default=1, help="skip chunks already written (1=yes,0=no)")
+    ap.add_argument("--online-merge", type=int, default=1, help="enable analyzer online merge (1) or disable (0)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -76,8 +77,9 @@ def main() -> None:
             "--duration-sec", str(sample_sec),
             "--output-csv", tmp_out,
             "--no-show", "--device", "cuda",
-            "--no-merge", "--merge-every-sec", "0",
         ]
+        if int(args.online_merge) == 0:
+            cmd += ["--no-merge", "--merge-every-sec", "0"]
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
         t0 = time.time()
@@ -226,8 +228,9 @@ def main() -> None:
             "--duration-sec", str(dur_s),
             "--output-csv", out_csv,
             "--no-show", "--device", "cuda",
-            "--no-merge", "--merge-every-sec", "0",
         ]
+        if int(args.online_merge) == 0:
+            cmd += ["--no-merge", "--merge-every-sec", "0"]
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
         env = None
