@@ -255,6 +255,25 @@ class UltimateParallelProcessor:
                 return False, chunk_id, None
         except:
             return False, chunk_id, None
+
+    def _ensure_models_downloaded(self):
+        """子プロセス起動前に必要モデルを一度だけ用意"""
+        # InsightFace buffalo_l
+        try:
+            models_dir = self.project_root / "models_insightface" / "models" / "buffalo_l"
+            if not models_dir.exists():
+                import shutil, urllib.request, zipfile
+                zip_path = self.project_root / "models_insightface" / "buffalo_l.zip"
+                models_dir.parent.mkdir(parents=True, exist_ok=True)
+                if not zip_path.exists():
+                    url = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
+                    print(f"Downloading buffalo_l.zip to {zip_path} ...")
+                    urllib.request.urlretrieve(url, str(zip_path))
+                print("Extracting buffalo_l.zip ...")
+                with zipfile.ZipFile(str(zip_path), 'r') as zf:
+                    zf.extractall(str(models_dir.parent))
+        except Exception as e:
+            print(f"モデル事前取得に失敗（継続）: {e}")
     
     def execute_with_eta_control(self):
         """ETA制御付きで実行"""
@@ -291,18 +310,34 @@ class UltimateParallelProcessor:
         # 並列処理実行
         print(f"究極性能並列処理開始: {len(chunks_to_process)} チャンク")
         
-        with mp.Pool(processes=min(self.num_chunks, mp.cpu_count())) as pool:
-            results = pool.map(self.process_chunk_with_monitoring, chunks_to_process)
-        
-        # 結果集計
+        # 進捗計算用: チャンクID→秒数
+        chunk_id_to_sec = {cid: dur for (cid, _st, dur) in chunks}
+        completed_secs = 0.0
+        total_secs = sum(chunk_id_to_sec.values())
         successful_chunks = []
-        for success, chunk_id, output_csv in results:
-            if success:
-                successful_chunks.append(output_csv)
-                # 親プロセス側で進捗を永続化
-                self.chunk_results.append((True, chunk_id, output_csv))
-        # 中断再開用に保存
-        self._save_resume_state()
+        
+        # モデルの事前ダウンロード（InsightFaceなど）
+        self._ensure_models_downloaded()
+        
+        with mp.Pool(processes=min(self.num_chunks, mp.cpu_count())) as pool:
+            for success, chunk_id, output_csv in pool.imap_unordered(self.process_chunk_with_monitoring, chunks_to_process):
+                if success:
+                    successful_chunks.append(output_csv)
+                    self.chunk_results.append((True, chunk_id, output_csv))
+                    completed_secs += chunk_id_to_sec.get(chunk_id, 0.0)
+                else:
+                    # 失敗でもETA計算に含めない
+                    pass
+                # ETA表示
+                elapsed = time.time() - self.start_time
+                if completed_secs > 0:
+                    rate = completed_secs / elapsed
+                    remaining = max(0.0, (total_secs - completed_secs) / rate) if rate > 0 else float('inf')
+                    print(f"進捗: {completed_secs:.1f}/{total_secs:.1f} 秒分 完了 | 経過: {elapsed:.1f}s | 推定残り: {remaining:.1f}s")
+                else:
+                    print(f"経過: {elapsed:.1f}s | 進捗計測待ち...")
+                # 随時保存
+                self._save_resume_state()
         
         end_time = time.time()
         processing_time = end_time - self.start_time
