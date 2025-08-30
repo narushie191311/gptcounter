@@ -602,12 +602,40 @@ def main() -> None:
                         dispatch_time[start_sec] = time.time()
                         w = (float(total_sec) - start_sec) if (dur == 0.0 and total_sec > 0) else float(dur)
                         expected_span[start_sec] = max(0.0, w)
-                    rc = run_proc_streaming(c, e, project_root, float(args.per_chunk_timeout_sec), pref, _cb)
+                    # 動的タイムアウト（ユーザー未指定の場合のみ）
+                    timeout_sec = float(args.per_chunk_timeout_sec) if args.per_chunk_timeout_sec else 0.0
+                    if timeout_sec <= 0.0:
+                        with lock:
+                            w = expected_span.get(start_sec, float(dur if dur > 0.0 else max(0.0, float(total_sec) - start_sec)))
+                            vps = speed_ema[0] if speed_ema[0] > 0 else 0.0
+                        # 推定: 期待時間 = w / max(vps, 0.5)
+                        exp_wall = (w / max(0.5, vps)) if vps > 0 else max(300.0, w)  # vps未知ならw秒相当、最低5分
+                        timeout_sec = max(600.0, exp_wall * 3.0)  # 3倍の余裕
+                    rc = run_proc_streaming(c, e, project_root, timeout_sec, pref, _cb)
                     tries = 0
                     while rc != 0 and tries < int(args.retries):
                         tries += 1
-                        print(f"[RETRY] start={start_sec:.1f}s try={tries} rc={rc}")
-                        rc = run_proc_streaming(c, e, project_root, float(args.per_chunk_timeout_sec) if args.per_chunk_timeout_sec else 0.0, pref, _cb)
+                        # リトライは軽量化オーバーライドを追加（末尾優先で上書き）
+                        print(f"[RETRY] start={start_sec:.1f}s try={tries} rc={rc} -> applying light overrides")
+                        c2 = list(c)
+                        # 軽量化: 検出間引き+1（最大4）、解像度を段階的に下げ、モデルも段階的に小さく
+                        light_args = []
+                        try:
+                            # detect-every-n override
+                            light_args += ["--detect-every-n", str( min(4, 2 + tries) )]
+                            # det-size override
+                            # 段階: 2048 -> 1920 -> 1536
+                            det_map = {1: "2048x2048", 2: "1920x1920", 3: "1536x1536", 4: "1280x1280"}
+                            light_args += ["--det-size", det_map.get(tries, "1280x1280")]
+                            # yolo weights override
+                            yolo_seq = ["yolov8x.pt", "yolov8l.pt", "yolov8m.pt", "yolov8n.pt"]
+                            idx = min(tries, len(yolo_seq)-1)
+                            light_args += ["--yolo-weights", yolo_seq[idx]]
+                        except Exception:
+                            pass
+                        c2 += light_args
+                        # 次回タイムアウトも動的
+                        rc = run_proc_streaming(c2, e, project_root, timeout_sec, pref, _cb)
                     return (rc, start_sec, dur, out_path)
                 futs.append(ex.submit(worker))
             for fut in as_completed(futs):
