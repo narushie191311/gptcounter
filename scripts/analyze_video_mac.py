@@ -679,6 +679,7 @@ def analyze_video(
     output_csv_raw: Optional[str],
     start_sec: float,
     duration_sec: float,
+    global_start_sec: Optional[float] = None,
     show_window: bool = True,
     detect_every_n: int = 5,
     conf_threshold: float = 0.6,
@@ -1175,6 +1176,7 @@ def analyze_video(
         except Exception:
             pass
 
+    written_rows = 0
     try:
         # フレームイテレータ（PyAV/OpenCV）
         if dec_kind == "pyav":
@@ -1476,6 +1478,7 @@ def analyze_video(
                     run_started_jst_str,
                 ])
                 writer.writerow(row)
+                written_rows += 1
             
             # フレーム処理後にCSVをフラッシュ（データ損失防止）
             # パフォーマンス向上のため、フレーム毎ではなく適度な間隔でフラッシュ
@@ -1591,6 +1594,15 @@ def analyze_video(
             cv2.destroyAllWindows()
         if vw is not None:
             vw.release()
+        # チャンク完了の明示ログ（親プロセスがグローバル終了時刻を取得するため）
+        try:
+            fps_val = float(fps) if 'fps' in locals() else 30.0
+            current_video_sec = (frame_idx / max(1e-6, fps_val)) if 'frame_idx' in locals() else float(start_sec)
+            gstart = float(global_start_sec if global_start_sec is not None else start_sec)
+            gend = float(current_video_sec)
+            print(f"[CHUNK_COMPLETED] global_start_sec={gstart:.3f} global_end_sec={gend:.3f} rows={written_rows}", flush=True)
+        except Exception:
+            pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -1600,6 +1612,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--duration-sec", type=float, default=0.0, help="解析する秒数（0または省略で動画の最後まで）")
     p.add_argument("--output-csv", default=os.path.join("outputs", "analysis.csv"))
     p.add_argument("--output-csv-raw", default=None, help="非マージ（raw）行を併記保存するCSVパス（任意）")
+    p.add_argument("--global-start-sec", type=float, default=None, help="並列実行時に親から渡されるグローバル開始秒（省略可）")
     p.add_argument("--no-show", action="store_true", help="ウィンドウ表示を無効化")
     p.add_argument("--detect-every-n", type=int, default=5, help="Nフレーム毎に検出")
     p.add_argument("--conf", type=float, default=0.6, help="顔検出の信頼度しきい値")
@@ -1652,6 +1665,7 @@ def main() -> None:
         output_csv_raw=args.output_csv_raw,
         start_sec=args.start_sec,
         duration_sec=args.duration_sec,
+        global_start_sec=args.global_start_sec,
         show_window=show_flag,
         detect_every_n=args.detect_every_n,
         conf_threshold=args.conf,

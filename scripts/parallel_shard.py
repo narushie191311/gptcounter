@@ -29,6 +29,7 @@ def run_proc_streaming(
     cwd: Optional[str] = None,
     per_chunk_timeout_sec: float = 0.0,
     log_prefix: str = "",
+    on_line: Optional[callable] = None,
 ) -> int:
     """Run a child analyzer, stream logs to parent, and enforce optional timeout.
 
@@ -54,6 +55,11 @@ def run_proc_streaming(
                 else:
                     sys.stdout.write(line)
                 sys.stdout.flush()
+                if on_line is not None:
+                    try:
+                        on_line(line)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -355,6 +361,7 @@ def main() -> None:
             "--start-sec", str(start_s),
             "--duration-sec", str(dur_s),
             "--output-csv", out_csv,
+            "--global-start-sec", str(start_s),
             "--no-show", "--device", "cuda",
         ]
         if int(args.online_merge) == 0:
@@ -421,6 +428,54 @@ def main() -> None:
 
     t_main = time.time()
     processed_sec_completed = 0.0
+    # 子プロセスの進捗（0-1）を保持
+    progress_map: dict = {}
+    lock = threading.Lock()
+
+    def _parse_child_progress(line: str, start_key: float) -> None:
+        # 子の [PROGRESS] {percent}% を拾って chunk 進捗として保存
+        try:
+            if "[PROGRESS]" in line and "%" in line:
+                # 例: "[12:34:56] [PROGRESS] 23.45% | ..."
+                m = re.search(r"\[PROGRESS\]\s+([0-9]+(?:\.[0-9]+)?)%", line)
+                if m:
+                    perc = float(m.group(1)) / 100.0
+                    with lock:
+                        progress_map[start_key] = max(0.0, min(1.0, perc))
+            elif "[CHUNK_COMPLETED]" in line and "global_end_sec" in line:
+                # 完了時は100%に
+                with lock:
+                    progress_map[start_key] = 1.0
+        except Exception:
+            pass
+
+    def _global_progress_printer() -> None:
+        # 数秒ごとに全体進捗（加重平均）を出力
+        while True:
+            time.sleep(2.0)
+            with lock:
+                if total_sec > 0 and progress_map:
+                    # weight: 各チャンクの予定スパン（tailは(動画末尾-start)）
+                    done = 0.0
+                    weight_sum = 0.0
+                    for (s, d, _) in chunks:
+                        w = (float(total_sec) - s) if (d == 0.0 and total_sec > 0) else float(d)
+                        w = max(0.0, w)
+                        p = progress_map.get(s, 0.0)
+                        done += w * p
+                        weight_sum += w
+                    if weight_sum > 0:
+                        frac = max(0.0, min(100.0, (done / weight_sum) * 100.0))
+                        elapsed = time.time() - t_main
+                        # 推定速度: elapsedで何秒分進んだか（動画秒）
+                        est_speed = (done / max(1e-6, elapsed))
+                        remain_video = max(0.0, float(total_sec) - (covered_total + (done if done < weight_sum else weight_sum)))
+                        remain_sec = remain_video / max(1e-6, est_speed)
+                        print(f"[GLOBAL] progress={frac:.2f}% elapsed={elapsed/60:.1f}m ETA={max(0.0, remain_sec)/60:.1f}m")
+            # 終了判定（全チャンク登録済みかつ全て1.0になったら停止）
+            with lock:
+                if len(progress_map) >= len(chunks) and all(v >= 0.999 for v in progress_map.values()):
+                    break
 
     # optional GPU monitor
     stop_monitor = False
@@ -446,6 +501,8 @@ def main() -> None:
         mon_thread.start()
 
     try:
+        mon = threading.Thread(target=_global_progress_printer, daemon=True)
+        mon.start()
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = []
             for i, (s, d, op) in enumerate(chunks):
@@ -462,24 +519,42 @@ def main() -> None:
                 print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
                 prefix = f"[CHUNK s={int(s)} dur={dur_str}] "
                 # wrap with retries
-                def worker(c=cmd, e=env, pref=prefix, start_sec=s, dur=d):
-                    rc = run_proc_streaming(c, e, project_root, float(args.per_chunk_timeout_sec), pref)
+                def worker(c=cmd, e=env, pref=prefix, start_sec=s, dur=d, out_path=op):
+                    def _cb(line: str, key=start_sec):
+                        _parse_child_progress(line, key)
+                    rc = run_proc_streaming(c, e, project_root, float(args.per_chunk_timeout_sec), pref, _cb)
                     tries = 0
                     while rc != 0 and tries < int(args.retries):
                         tries += 1
                         print(f"[RETRY] start={start_sec:.1f}s try={tries} rc={rc}")
-                        rc = run_proc_streaming(c, e, project_root, float(args.per_chunk_timeout_sec) if args.per_chunk_timeout_sec else 0.0, pref)
-                    return (rc, start_sec, dur)
+                        rc = run_proc_streaming(c, e, project_root, float(args.per_chunk_timeout_sec) if args.per_chunk_timeout_sec else 0.0, pref, _cb)
+                    return (rc, start_sec, dur, out_path)
                 futs.append(ex.submit(worker))
             for fut in as_completed(futs):
-                rc, start_sec_done, dur_done = fut.result()
+                rc, start_sec_done, dur_done, out_csv_path = fut.result()
                 rcodes.append(rc)
                 if rc == 0 and total_sec > 0:
-                    # 正しいチャンク長: tail(dur==0)は total_sec - start_sec
-                    if dur_done == 0.0:
-                        span = max(0.0, float(total_sec) - float(start_sec_done))
+                    # 実際に処理できた終了時刻をCSVから取得（信頼性向上）
+                    actual_last = None
+                    try:
+                        rng = csv_range_seconds(out_csv_path)
+                        if rng is not None:
+                            # rng = (first_sec, last_sec) from file start
+                            actual_last = float(rng[1])
+                    except Exception:
+                        actual_last = None
+                    if actual_last is not None:
+                        # 実際のスパン = min(動画末尾, 実終了) - 開始
+                        span = max(0.0, min(float(total_sec), actual_last) - float(start_sec_done))
+                        # 予定スパン上限でクリップ（過剰加算防止、tailは0=末尾まで）
+                        if dur_done > 0.0:
+                            span = min(span, float(dur_done))
                     else:
-                        span = max(0.0, float(dur_done))
+                        # フォールバック: 正しいチャンク長: tail(dur==0)は total_sec - start_sec
+                        if dur_done == 0.0:
+                            span = max(0.0, float(total_sec) - float(start_sec_done))
+                        else:
+                            span = max(0.0, float(dur_done))
                     processed_sec_completed += span
                     total_done = min(float(total_sec), float(covered_total + processed_sec_completed))
                     done_frac = max(0.0, min(100.0, (total_done / max(1e-6, float(total_sec))) * 100.0))
