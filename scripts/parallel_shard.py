@@ -410,6 +410,31 @@ def main() -> None:
                 continue
             filtered.append((s, d, op))
         chunks = filtered
+
+    # Partial resume within chunks: if a chunk file exists and has last ts, start from there
+    adjusted: List[Tuple[float, float, str]] = []
+    for s, d, op in chunks:
+        new_s = s; new_d = d
+        try:
+            if os.path.exists(op):
+                rng = csv_range_seconds(op)
+            else:
+                rng = None
+            if rng:
+                first_s, last_s = rng
+                # last_s is absolute (ts_from_file_start), same scale as s
+                if last_s is not None and last_s > s + 1.0:
+                    # Adjust start to last_s, recompute duration
+                    new_s = float(last_s)
+                    if d == 0.0 and total_sec > 0:
+                        new_d = max(0.0, float(total_sec) - new_s)
+                    else:
+                        new_d = max(0.0, (s + d) - new_s)
+                    print(f"[RESUME-CHUNK] {int(s)}s -> {int(new_s)}s rem={new_d:.1f}s")
+        except Exception:
+            pass
+        adjusted.append((new_s, new_d, op))
+    chunks = adjusted
     rcodes = []
     def make_cmd(start_s: float, dur_s: float, out_csv: str, gpu_env: Optional[str], raw_csv: Optional[str]) -> Tuple[List[str], Optional[dict]]:
         # Auto device selection when user didn't specify in extra-args
