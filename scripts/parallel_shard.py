@@ -121,6 +121,7 @@ def main() -> None:
     ap.add_argument("--auto-tune", type=int, default=0, help="auto tune workers from GPU VRAM and host RAM (1=on)")
     ap.add_argument("--gpu-monitor-sec", type=float, default=20.0, help="print GPU usage every N seconds (0=off)")
     ap.add_argument("--host-mem-per-proc-gb", type=float, default=2.0, help="estimated host RAM required per process (GB)")
+    ap.add_argument("--verify-coverage", type=int, default=1, help="verify merged coverage against video length and print summary (1=on)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -761,6 +762,67 @@ def main() -> None:
                     fo.write(parts_out + "\n")
     print(f"[PARALLEL] merged -> {final_out}")
 
+    # Coverage verification for merged final CSV
+    def _hhmmss_to_sec(s: str) -> Optional[float]:
+        try:
+            parts = s.strip().split(":")
+            if len(parts) != 3:
+                return None
+            h = int(parts[0]); m = int(parts[1]); rest = parts[2]
+            if "." in rest:
+                sec, ms = rest.split(".")
+                return h*3600 + m*60 + int(sec) + int((ms+"000")[:3])/1000.0
+            return h*3600 + m*60 + int(rest)
+        except Exception:
+            return None
+
+    def _compute_coverage(csv_path: str) -> Tuple[Optional[float], Optional[float]]:
+        try:
+            with open(csv_path, newline="") as f:
+                header = f.readline().rstrip("\n").split(",")
+                try:
+                    idx = header.index("ts_from_file_start")
+                except ValueError:
+                    try:
+                        idx = header.index("timestamp")
+                    except ValueError:
+                        return None, None
+                min_s = None; max_s = None
+                for line in f:
+                    parts = line.rstrip("\n").split(",")
+                    if idx >= len(parts):
+                        continue
+                    v = _hhmmss_to_sec(parts[idx])
+                    if v is None:
+                        continue
+                    if min_s is None:
+                        min_s = v
+                    max_s = v
+                return min_s, max_s
+        except Exception:
+            return None, None
+
+    if int(args.verify_coverage) == 1 and total_sec > 0:
+        min_s, max_s = _compute_coverage(final_out)
+        if min_s is not None and max_s is not None:
+            covered = max(0.0, float(max_s) - float(min_s))
+            try:
+                vstart = parse_video_start_datetime(args.video)
+                if vstart is not None:
+                    from datetime import timedelta as _td
+                    start_clock = (vstart + _td(seconds=float(min_s))).strftime("%H:%M:%S")
+                    end_clock = (vstart + _td(seconds=float(max_s))).strftime("%H:%M:%S")
+                else:
+                    start_clock = end_clock = ""
+            except Exception:
+                start_clock = end_clock = ""
+            print(f"[COVERAGE] {os.path.basename(final_out)}: start={min_s:.3f}s end={max_s:.3f}s span={covered:.1f}s (~{covered/60:.1f}m) start_clock={start_clock} end_clock={end_clock}")
+            missing = max(0.0, float(total_sec) - covered)
+            if missing > float(total_sec) * 0.05:
+                print(f"[WARN] coverage below expected: total_video~{total_sec:.1f}s, missing~{missing:.1f}s")
+        else:
+            print("[WARN] could not compute coverage from merged CSV (no ts_from_file_start/timestamp)")
+
     # RAWの結合（ユーザーが要求した場合）
     if args.raw_output.strip():
         raw_final = args.raw_output.strip()
@@ -780,6 +842,28 @@ def main() -> None:
                     for line in fi:
                         fo.write(line)
         print(f"[PARALLEL] raw merged -> {raw_final}")
+
+        # Coverage verification for raw merged as well
+        if int(args.verify_coverage) == 1 and total_sec > 0:
+            min_s, max_s = _compute_coverage(raw_final)
+            if min_s is not None and max_s is not None:
+                covered = max(0.0, float(max_s) - float(min_s))
+                try:
+                    vstart = parse_video_start_datetime(args.video)
+                    if vstart is not None:
+                        from datetime import timedelta as _td
+                        start_clock = (vstart + _td(seconds=float(min_s))).strftime("%H:%M:%S")
+                        end_clock = (vstart + _td(seconds=float(max_s))).strftime("%H:%M:%S")
+                    else:
+                        start_clock = end_clock = ""
+                except Exception:
+                    start_clock = end_clock = ""
+                print(f"[COVERAGE-RAW] {os.path.basename(raw_final)}: start={min_s:.3f}s end={max_s:.3f}s span={covered:.1f}s (~{covered/60:.1f}m) start_clock={start_clock} end_clock={end_clock}")
+                missing = max(0.0, float(total_sec) - covered)
+                if missing > float(total_sec) * 0.05:
+                    print(f"[WARN] raw coverage below expected: total_video~{total_sec:.1f}s, missing~{missing:.1f}s")
+            else:
+                print("[WARN] could not compute coverage from raw merged CSV")
 
 
 if __name__ == "__main__":
