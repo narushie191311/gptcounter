@@ -389,6 +389,19 @@ def main() -> None:
         chunks = filtered
     rcodes = []
     def make_cmd(start_s: float, dur_s: float, out_csv: str, gpu_env: Optional[str], raw_csv: Optional[str]) -> Tuple[List[str], Optional[dict]]:
+        # Auto device selection when user didn't specify in extra-args
+        extra = args.extra_args.strip()
+        auto_device = None
+        try:
+            if ("--device" not in extra):
+                if torch is not None and torch.cuda.is_available() and gpu_ids:
+                    auto_device = "cuda"
+                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    auto_device = "mps"
+                else:
+                    auto_device = "cpu"
+        except Exception:
+            auto_device = None
         cmd = [
             sys.executable,
             analyzer_path,
@@ -397,8 +410,10 @@ def main() -> None:
             "--duration-sec", str(dur_s),
             "--output-csv", out_csv,
             "--global-start-sec", str(start_s),
-            "--no-show", "--device", "cuda",
+            "--no-show",
         ]
+        if auto_device:
+            cmd += ["--device", auto_device]
         if int(args.online_merge) == 0:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
         # add per-chunk raw path unless user already forced one in extra-args
