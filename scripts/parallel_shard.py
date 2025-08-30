@@ -31,6 +31,7 @@ def run_proc_streaming(
     per_chunk_timeout_sec: float = 0.0,
     log_prefix: str = "",
     on_line: Optional[callable] = None,
+    suppress_init: bool = False,
 ) -> int:
     """Run a child analyzer, stream logs to parent, and enforce optional timeout.
 
@@ -47,15 +48,35 @@ def run_proc_streaming(
         universal_newlines=True,
     )
 
+    # patterns to suppress (noisy init logs)
+    quiet_keys = (
+        "Applied providers:",
+        "find model:",
+        "computation_placer already registered",
+        "YOLOv8",
+        "Downloading",
+        "Creating new Ultralytics Settings",
+    )
+
+    def _should_print(line: str) -> bool:
+        if not suppress_init:
+            return True
+        lo = line.strip()
+        for k in quiet_keys:
+            if k in lo:
+                return False
+        return True
+
     def _pump():
         assert p.stdout is not None
         for line in iter(p.stdout.readline, ""):
             try:
-                if log_prefix:
-                    sys.stdout.write(f"{log_prefix}{line}")
-                else:
-                    sys.stdout.write(line)
-                sys.stdout.flush()
+                if _should_print(line):
+                    if log_prefix:
+                        sys.stdout.write(f"{log_prefix}{line}")
+                    else:
+                        sys.stdout.write(line)
+                    sys.stdout.flush()
                 if on_line is not None:
                     try:
                         on_line(line)
@@ -491,6 +512,8 @@ def main() -> None:
     processed_sec_completed = 0.0
     # 子プロセスの進捗（0-1）を保持
     progress_map: dict = {}
+    # per-chunk timestamps for ETA
+    start_wall_map: dict = {}
     lock = threading.Lock()
     # ディスパッチ時刻と期待スパンを保持（フォールバック推定に使用）
     dispatch_time: dict = {}
@@ -546,7 +569,22 @@ def main() -> None:
                         est_speed = (done / max(1e-6, elapsed))
                         remain_video = max(0.0, float(total_sec) - (covered_total + (done if done < weight_sum else weight_sum)))
                         remain_sec = remain_video / max(1e-6, est_speed)
-                        print(f"[GLOBAL] progress={frac:.2f}% elapsed={elapsed/60:.1f}m ETA={max(0.0, remain_sec)/60:.1f}m")
+                        # per-chunk ETAs
+                        parts = []
+                        now = time.time()
+                        for (s, d, _) in chunks:
+                            w = (float(total_sec) - s) if (d == 0.0 and total_sec > 0) else float(d)
+                            w = max(0.0, w)
+                            p = progress_map.get(s, 0.0)
+                            st = start_wall_map.get(s, None)
+                            eta_c = None
+                            if st is not None and p > 0 and w > 0:
+                                elapsed_c = now - st
+                                speed_c = (w * p) / max(1e-6, elapsed_c)
+                                remain_c = (w * (1.0 - p)) / max(1e-6, speed_c)
+                                eta_c = remain_c
+                            parts.append(f"s={int(s)} {p*100:.1f}% ETA={eta_c/60:.1f}m" if eta_c is not None else f"s={int(s)} {p*100:.1f}%")
+                        print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% elapsed={elapsed/60:.1f}m ETA={max(0.0, remain_sec)/60:.1f}m | { ' | '.join(parts[:8])}{' ...' if len(parts)>8 else ''}")
             # 終了判定（全チャンク登録済みかつ全て1.0になったら停止）
             with lock:
                 if len(progress_map) >= len(chunks) and all(v >= 0.999 for v in progress_map.values()):
@@ -612,7 +650,9 @@ def main() -> None:
                         # 推定: 期待時間 = w / max(vps, 0.5)
                         exp_wall = (w / max(0.5, vps)) if vps > 0 else max(300.0, w)  # vps未知ならw秒相当、最低5分
                         timeout_sec = max(600.0, exp_wall * 3.0)  # 3倍の余裕
-                    rc = run_proc_streaming(c, e, project_root, timeout_sec, pref, _cb)
+                    with lock:
+                        start_wall_map[start_sec] = time.time()
+                    rc = run_proc_streaming(c, e, project_root, timeout_sec, pref, _cb, suppress_init=True)
                     tries = 0
                     while rc != 0 and tries < int(args.retries):
                         tries += 1
@@ -636,7 +676,9 @@ def main() -> None:
                             pass
                         c2 += light_args
                         # 次回タイムアウトも動的
-                        rc = run_proc_streaming(c2, e, project_root, timeout_sec, pref, _cb)
+                        with lock:
+                            start_wall_map[start_sec] = time.time()
+                        rc = run_proc_streaming(c2, e, project_root, timeout_sec, pref, _cb, suppress_init=True)
                     return (rc, start_sec, dur, out_path)
                 futs.append(ex.submit(worker))
             for fut in as_completed(futs):
