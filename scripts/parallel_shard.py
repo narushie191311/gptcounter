@@ -143,6 +143,7 @@ def main() -> None:
     ap.add_argument("--gpu-monitor-sec", type=float, default=20.0, help="print GPU usage every N seconds (0=off)")
     ap.add_argument("--host-mem-per-proc-gb", type=float, default=2.0, help="estimated host RAM required per process (GB)")
     ap.add_argument("--verify-coverage", type=int, default=1, help="verify merged coverage against video length and print summary (1=on)")
+    ap.add_argument("--allow-partial", type=int, default=0, help="do not fail on some shard errors; merge whatever succeeded (1=on)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -740,7 +741,10 @@ def main() -> None:
     finally:
         stop_monitor = True
     if any(r != 0 for r in rcodes):
-        raise SystemExit(f"some shards failed: {rcodes}")
+        if int(args.allow_partial) == 1:
+            print(f"[WARN] some shards failed but allow-partial=1: {rcodes}")
+        else:
+            raise SystemExit(f"some shards failed: {rcodes}")
 
     # 連結（ヘッダは先頭のみ）かつ timestamp を動画全体の相対に正規化
     final_out = os.path.join(out_dir, f"{base_name}_{video_id}_merged.csv")
