@@ -145,6 +145,7 @@ def main() -> None:
     ap.add_argument("--host-mem-per-proc-gb", type=float, default=2.0, help="estimated host RAM required per process (GB)")
     ap.add_argument("--verify-coverage", type=int, default=1, help="verify merged coverage against video length and print summary (1=on)")
     ap.add_argument("--allow-partial", type=int, default=0, help="do not fail on some shard errors; merge whatever succeeded (1=on)")
+    ap.add_argument("--workers", type=int, default=0, help="cap total concurrent workers (0=auto)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -246,6 +247,9 @@ def main() -> None:
     if args.gpus.strip():
         gpu_ids = [g.strip() for g in args.gpus.split(",") if g.strip()]
     max_workers = shards if not gpu_ids else min(shards, max(1, len(gpu_ids) * max(1, int(args.procs_per_gpu))))
+    # user cap
+    if int(getattr(args, "workers", 0)) > 0:
+        max_workers = max(1, min(max_workers, int(args.workers)))
 
     # auto-tune procs-per-gpu by VRAM
     def _read_gpu_mem_mb() -> List[tuple]:
