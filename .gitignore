@@ -6,3 +6,14 @@ models_insightface/
 *.mp4
 *.mkv
 .DS_Store
+
+# artifacts
+outputs/**
+*.csv
+*.csv.gz
+*.zip
+*.pt
+*.onnx
+*.engine
+models_insightface/**
+logs/**

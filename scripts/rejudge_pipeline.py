@@ -61,7 +61,9 @@ def rejudge_gender_age(merged_path: str, out_path: str) -> None:
     agg_g = dfg.groupby("person_id").apply(lambda x: "Female" if (x["g"]*x["w"]).sum()/max(x["w"].sum(),1e-6) >= 0.5 else "Male")
     agg_g = agg_g.rename("gender_rejudged")
     # age trimmed weighted mean
-    age = pd.to_numeric(df.get("age"), errors="coerce")
+    # use age or fallback to age_face if present
+    age_series = df.get("age") if "age" in df.columns else df.get("age_face")
+    age = pd.to_numeric(age_series, errors="coerce")
     dfa = pd.DataFrame({"person_id": df.get("person_id"), "age": age, "w": w})
     def trimmed_wmean(x, trim=0.1):
         x = x.dropna()

@@ -12,6 +12,7 @@ import threading
 from datetime import datetime, timedelta
 import re
 from typing import List, Optional, Tuple
+import json
 
 import cv2
 try:
@@ -610,7 +611,22 @@ def main() -> None:
                                 remain_c = (w * (1.0 - p)) / max(1e-6, speed_c)
                                 eta_c = remain_c
                             parts.append(f"s={int(s)} {p*100:.1f}% ETA={eta_c/60:.1f}m" if eta_c is not None else f"s={int(s)} {p*100:.1f}%")
-                        print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% elapsed={elapsed/60:.1f}m ETA={max(0.0, remain_sec)/60:.1f}m | { ' | '.join(parts[:8])}{' ...' if len(parts)>8 else ''}")
+                        print(f"[PROGRESS] processed_est={done:.1f}s ({frac:.2f}%) | chunks={len(chunks)} elapsed={elapsed/60:.1f}m ETA={max(0.0, remain_sec)/60:.1f}m | { ' | '.join(parts[:8])}{' ...' if len(parts)>8 else ''}")
+                        # persist progress jsonl
+                        try:
+                            prog = {
+                                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "processed_est_sec": round(float(done), 2),
+                                "percent": round(float(frac), 2),
+                                "elapsed_sec": round(float(elapsed), 1),
+                                "eta_sec": round(float(max(0.0, remain_sec)), 1),
+                                "chunks": len(chunks),
+                            }
+                            pj = os.path.join(work_dir, "progress_history.jsonl")
+                            with open(pj, "a") as pf:
+                                pf.write(json.dumps(prog, ensure_ascii=False) + "\n")
+                        except Exception:
+                            pass
             # 終了判定（全チャンク登録済みかつ全て1.0になったら停止）
             with lock:
                 if len(progress_map) >= len(chunks) and all(v >= 0.999 for v in progress_map.values()):
@@ -758,7 +774,7 @@ def main() -> None:
                         est_speed = total_done / max(1e-6, elapsed)
                     remain_video = max(0.0, float(total_sec) - total_done)
                     remain_sec = remain_video / max(1e-6, est_speed)
-                    print(f"[GLOBAL] progress={done_frac:.2f}% elapsed={elapsed/60:.1f}m ETA={remain_sec/60:.1f}m")
+                    print(f"[PROGRESS] processed={total_done:.1f}s ({done_frac:.2f}%) | elapsed={elapsed/60:.1f}m ETA={remain_sec/60:.1f}m")
     except KeyboardInterrupt:
         print("\n[PARALLEL] KeyboardInterrupt received. Waiting for running tasks to terminate...")
         # The streaming function will exit when processes are killed by the environment/user.
