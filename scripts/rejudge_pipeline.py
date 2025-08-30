@@ -110,9 +110,11 @@ def main():
     ap.add_argument("--video-name", required=True, help="video filename to parse start time (e.g., merged_20250817_1145-1933.mkv)")
     ap.add_argument("--out-rejudged", required=True, help="output CSV with gender_rejudged, age_rejudged")
     ap.add_argument("--out-clock", required=True, help="output CSV adding clock_time column")
+    ap.add_argument("--no-rejudge", action="store_true", help="skip rejudging gender/age (first pass)")
     args = ap.parse_args()
 
-    rejudge_gender_age(args.merged, args.out_rejudged)
+    if not args.no_rejudge:
+        rejudge_gender_age(args.merged, args.out_rejudged)
     add_clock_time(args.merged, args.video_name, args.out_clock)
     print("done")
 

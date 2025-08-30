@@ -8,7 +8,9 @@ import pandas as pd
 
 def run_merge_optimize(raw_path: str, out_path: str, target: int, workers: int) -> None:
     cmd = [sys.executable, "scripts/merge_optimize.py", "--input", raw_path, "--output", out_path,
-           "--target-count", str(target), "--mode", "graph", "--workers", str(workers)]
+           "--mode", "graph", "--workers", str(workers)]
+    if target and target > 0:
+        cmd += ["--target-count", str(target)]
     rc = subprocess.call(cmd)
     if rc != 0:
         raise SystemExit(f"merge_optimize failed rc={rc}")
