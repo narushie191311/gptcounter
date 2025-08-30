@@ -3,6 +3,7 @@ import argparse
 import os
 import re
 import subprocess
+import psutil
 from pathlib import Path
 import sys
 import time
@@ -117,8 +118,9 @@ def main() -> None:
     ap.add_argument("--raw-output", default="", help="final merged RAW (non-merged-by-IDs) CSV path. If set, per-chunk raw files are auto-generated and merged here")
     ap.add_argument("--per-chunk-timeout-sec", type=float, default=0.0, help="kill a chunk if it exceeds this wall time (0=disable)")
     ap.add_argument("--prewarm-sec", type=float, default=2.0, help="run a short single analyzer to pre-download models (0=disable)")
-    ap.add_argument("--auto-tune", type=int, default=0, help="auto tune procs-per-gpu from VRAM and mem-per-proc-gb (1=on)")
+    ap.add_argument("--auto-tune", type=int, default=0, help="auto tune workers from GPU VRAM and host RAM (1=on)")
     ap.add_argument("--gpu-monitor-sec", type=float, default=20.0, help="print GPU usage every N seconds (0=off)")
+    ap.add_argument("--host-mem-per-proc-gb", type=float, default=2.0, help="estimated host RAM required per process (GB)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -222,28 +224,47 @@ def main() -> None:
     max_workers = shards if not gpu_ids else min(shards, max(1, len(gpu_ids) * max(1, int(args.procs_per_gpu))))
 
     # auto-tune procs-per-gpu by VRAM
-    def _read_gpu_total_mem_mb() -> List[int]:
+    def _read_gpu_mem_mb() -> List[tuple]:
         try:
-            out = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"], text=True)
-            vals = [int(x.strip()) for x in out.strip().splitlines() if x.strip()]
+            out = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"], text=True)
+            vals = []
+            for line in out.strip().splitlines():
+                parts = [p.strip() for p in line.split(',')]
+                if len(parts) >= 2:
+                    free_mb = int(parts[0]); total_mb = int(parts[1])
+                    vals.append((free_mb, total_mb))
             return vals
         except Exception:
             return []
-    if args.auto_tune and gpu_ids:
-        totals = _read_gpu_total_mem_mb()
-        if totals:
-            # pick selected GPUs' totals; fallback to min across available
-            try:
-                sel = [totals[int(i)] for i in gpu_ids]
-            except Exception:
-                sel = totals
-            min_mb = min(sel) if sel else 0
-            per_proc_gb = max(0.5, float(args.mem_per_proc_gb))
-            auto_ppg = max(1, int((min_mb / 1024.0) // per_proc_gb))
-            prev = max(1, int(args.procs_per_gpu))
-            suggested = max(prev, auto_ppg)
-            max_workers = min(shards, suggested * len(gpu_ids))
-            print(f"[AUTOTUNE] min_vram={min_mb/1024.0:.1f}GB mem_per_proc_gb={per_proc_gb:.1f} -> procs_per_gpu={suggested} max_workers={max_workers}")
+    if args.auto_tune:
+        # GPU VRAM-based cap
+        if gpu_ids:
+            mems = _read_gpu_mem_mb()
+            if mems:
+                try:
+                    sel = [mems[int(i)] for i in gpu_ids]
+                except Exception:
+                    sel = mems
+                min_free_mb = min([m[0] for m in sel]) if sel else 0
+                per_proc_gb = max(0.5, float(args.mem_per_proc_gb))
+                auto_ppg = max(1, int((min_free_mb / 1024.0) // per_proc_gb))
+                # respect user cap but never exceed auto_ppg
+                requested_ppg = max(1, int(args.procs_per_gpu))
+                effective_ppg = min(requested_ppg, auto_ppg)
+                max_workers = min(shards, effective_ppg * len(gpu_ids))
+                print(f"[AUTOTUNE(gpu)] min_free_vram={min_free_mb/1024.0:.1f}GB per_proc={per_proc_gb:.1f}GB -> procs_per_gpu={effective_ppg} max_workers={max_workers}")
+        # Host RAM-based cap
+        try:
+            vm = psutil.virtual_memory()
+            avail_gb = float(vm.available) / (1024**3)
+            host_per_proc = max(0.5, float(args.host_mem_per_proc_gb))
+            host_cap = max(1, int(avail_gb // host_per_proc))
+            prev = max_workers
+            max_workers = min(max_workers, host_cap)
+            if prev != max_workers:
+                print(f"[AUTOTUNE(host)] avail_ram={avail_gb:.1f}GB per_proc={host_per_proc:.1f}GB -> cap_workers={max_workers}")
+        except Exception:
+            pass
 
     # 動的スケジューリング: チャンクのキューを作成
     chunk_sec = max(30.0, float(args.chunk_sec))
@@ -431,6 +452,11 @@ def main() -> None:
     # 子プロセスの進捗（0-1）を保持
     progress_map: dict = {}
     lock = threading.Lock()
+    # ディスパッチ時刻と期待スパンを保持（フォールバック推定に使用）
+    dispatch_time: dict = {}
+    expected_span: dict = {}
+    # 完了チャンクから推定する平均処理速度（動画秒/壁時計秒）
+    speed_ema: list = [0.0]  # mutable box
 
     def _parse_child_progress(line: str, start_key: float) -> None:
         # 子の [PROGRESS] {percent}% を拾って chunk 進捗として保存
@@ -454,14 +480,23 @@ def main() -> None:
         while True:
             time.sleep(2.0)
             with lock:
-                if total_sec > 0 and progress_map:
+                if total_sec > 0:
                     # weight: 各チャンクの予定スパン（tailは(動画末尾-start)）
                     done = 0.0
                     weight_sum = 0.0
+                    now = time.time()
                     for (s, d, _) in chunks:
                         w = (float(total_sec) - s) if (d == 0.0 and total_sec > 0) else float(d)
                         w = max(0.0, w)
-                        p = progress_map.get(s, 0.0)
+                        p = progress_map.get(s)
+                        if p is None:
+                            # フォールバック: 経過時間と速度EMAから進捗推定
+                            dt = now - dispatch_time.get(s, now)
+                            vps = speed_ema[0] if speed_ema[0] > 0 else 0.0
+                            if vps > 0 and w > 0:
+                                p = max(0.0, min(1.0, (dt * vps) / w))
+                            else:
+                                p = 0.0
                         done += w * p
                         weight_sum += w
                     if weight_sum > 0:
@@ -522,6 +557,12 @@ def main() -> None:
                 def worker(c=cmd, e=env, pref=prefix, start_sec=s, dur=d, out_path=op):
                     def _cb(line: str, key=start_sec):
                         _parse_child_progress(line, key)
+                    # 登録（初期値0.0）とディスパッチ時刻/期待スパン
+                    with lock:
+                        progress_map.setdefault(start_sec, 0.0)
+                        dispatch_time[start_sec] = time.time()
+                        w = (float(total_sec) - start_sec) if (dur == 0.0 and total_sec > 0) else float(dur)
+                        expected_span[start_sec] = max(0.0, w)
                     rc = run_proc_streaming(c, e, project_root, float(args.per_chunk_timeout_sec), pref, _cb)
                     tries = 0
                     while rc != 0 and tries < int(args.retries):
@@ -536,6 +577,7 @@ def main() -> None:
                 if rc == 0 and total_sec > 0:
                     # 実際に処理できた終了時刻をCSVから取得（信頼性向上）
                     actual_last = None
+                    elapsed_wall = None
                     try:
                         rng = csv_range_seconds(out_csv_path)
                         if rng is not None:
@@ -543,12 +585,24 @@ def main() -> None:
                             actual_last = float(rng[1])
                     except Exception:
                         actual_last = None
+                    try:
+                        with lock:
+                            dt = time.time() - dispatch_time.get(start_sec_done, t_main)
+                        if dt and dt > 0:
+                            elapsed_wall = dt
+                    except Exception:
+                        elapsed_wall = None
                     if actual_last is not None:
                         # 実際のスパン = min(動画末尾, 実終了) - 開始
                         span = max(0.0, min(float(total_sec), actual_last) - float(start_sec_done))
                         # 予定スパン上限でクリップ（過剰加算防止、tailは0=末尾まで）
                         if dur_done > 0.0:
                             span = min(span, float(dur_done))
+                        # 速度EMA更新（動画秒/壁秒）
+                        if elapsed_wall and elapsed_wall > 0 and span > 0:
+                            v = span / elapsed_wall
+                            with lock:
+                                speed_ema[0] = v if speed_ema[0] <= 0 else (0.7 * speed_ema[0] + 0.3 * v)
                     else:
                         # フォールバック: 正しいチャンク長: tail(dur==0)は total_sec - start_sec
                         if dur_done == 0.0:
