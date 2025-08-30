@@ -474,23 +474,25 @@ def main() -> None:
             for fut in as_completed(futs):
                 rc, start_sec_done, dur_done = fut.result()
                 rcodes.append(rc)
-                if rc == 0:
-                    # update processed seconds for progress
-                    if total_sec > 0:
-                        span = (total_sec if (dur_done == 0.0 and total_sec > 0) else float(dur_done))
-                        if span > 0:
-                            processed_sec_completed += span
-                    done_frac = ((covered_total + processed_sec_completed) / max(1e-6, total_sec)) * 100.0 if total_sec > 0 else 0.0
+                if rc == 0 and total_sec > 0:
+                    # 正しいチャンク長: tail(dur==0)は total_sec - start_sec
+                    if dur_done == 0.0:
+                        span = max(0.0, float(total_sec) - float(start_sec_done))
+                    else:
+                        span = max(0.0, float(dur_done))
+                    processed_sec_completed += span
+                    total_done = min(float(total_sec), float(covered_total + processed_sec_completed))
+                    done_frac = max(0.0, min(100.0, (total_done / max(1e-6, float(total_sec))) * 100.0))
                     elapsed = time.time() - t_main
                     # estimate speed from warmup if available else from runtime
-                    est_speed = None
                     try:
-                        est_speed = warm_speed
+                        est_speed = warm_speed if warm_speed and warm_speed > 0 else None
                     except Exception:
                         est_speed = None
                     if not est_speed:
-                        est_speed = (covered_total + processed_sec_completed) / max(1e-6, elapsed)
-                    remain_sec = (total_sec - (covered_total + processed_sec_completed)) / max(1e-6, est_speed) if total_sec > 0 else 0.0
+                        est_speed = total_done / max(1e-6, elapsed)
+                    remain_video = max(0.0, float(total_sec) - total_done)
+                    remain_sec = remain_video / max(1e-6, est_speed)
                     print(f"[GLOBAL] progress={done_frac:.2f}% elapsed={elapsed/60:.1f}m ETA={remain_sec/60:.1f}m")
     except KeyboardInterrupt:
         print("\n[PARALLEL] KeyboardInterrupt received. Waiting for running tasks to terminate...")
