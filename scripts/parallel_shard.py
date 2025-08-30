@@ -175,6 +175,15 @@ def main() -> None:
         # quick warmup run to measure throughput (video_sec per wall_sec)
         sample_sec = min(max(10.0, args.warmup_sec), max(10.0, total_sec * 0.02) if total_sec > 0 else args.warmup_sec)
         tmp_out = os.path.join(out_dir, f"{base_name}_warmup.csv")
+        # decide warmup device (auto: cuda if available else mps else cpu)
+        warmup_device = "cpu"
+        try:
+            if torch is not None and torch.cuda.is_available():
+                warmup_device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                warmup_device = "mps"
+        except Exception:
+            warmup_device = "cpu"
         cmd = [
             sys.executable,
             analyzer_path,
@@ -182,7 +191,7 @@ def main() -> None:
             "--start-sec", "0",
             "--duration-sec", str(sample_sec),
             "--output-csv", tmp_out,
-            "--no-show", "--device", "cuda",
+            "--no-show", "--device", warmup_device,
         ]
         if int(args.online_merge) == 0:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
@@ -220,6 +229,15 @@ def main() -> None:
     # optional prewarm to avoid model downloads by each child
     if args.prewarm_sec and args.prewarm_sec > 0.0:
         tmp_out = os.path.join(out_dir, f"{base_name}_prewarm.csv")
+        # decide prewarm device (auto)
+        prewarm_device = "cpu"
+        try:
+            if torch is not None and torch.cuda.is_available():
+                prewarm_device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                prewarm_device = "mps"
+        except Exception:
+            prewarm_device = "cpu"
         cmd = [
             sys.executable,
             analyzer_path,
@@ -227,7 +245,7 @@ def main() -> None:
             "--start-sec", "0",
             "--duration-sec", str(max(0.5, float(args.prewarm_sec))),
             "--output-csv", tmp_out,
-            "--no-show", "--device", "cuda",
+            "--no-show", "--device", prewarm_device,
         ]
         if int(args.online_merge) == 0:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
@@ -246,10 +264,23 @@ def main() -> None:
     gpu_ids: List[str] = []
     if args.gpus.strip():
         gpu_ids = [g.strip() for g in args.gpus.split(",") if g.strip()]
+    else:
+        # auto-select GPU 0 if CUDA is available and user didn't provide --gpus
+        try:
+            if torch is not None and torch.cuda.is_available():
+                gpu_ids = ["0"]
+                print("[AUTOTUNE] CUDA detected. Using GPU: 0 (auto)")
+        except Exception:
+            pass
     max_workers = shards if not gpu_ids else min(shards, max(1, len(gpu_ids) * max(1, int(args.procs_per_gpu))))
-    # user cap
+    # user cap: if specified, force to that value and sync shards for CPU/MPS path
     if int(getattr(args, "workers", 0)) > 0:
-        max_workers = max(1, min(max_workers, int(args.workers)))
+        wanted = max(1, int(args.workers))
+        if not gpu_ids:
+            shards = max(shards, wanted)
+            max_workers = wanted
+        else:
+            max_workers = min(max_workers, wanted)
 
     # auto-tune procs-per-gpu by VRAM
     def _read_gpu_mem_mb() -> List[tuple]:
@@ -295,18 +326,49 @@ def main() -> None:
                 else:
                     auto_yolo = "yolov8n.pt"; auto_det = "1536x1536"; auto_dn = 2
                 print(f"[AUTOTUNE(quality)] per_proc_vram={vram_per_proc_gb:.1f}GB -> yolo={auto_yolo} det={auto_det} dN={auto_dn}")
-        # Host RAM-based cap
+        # Host RAM-based cap (applies to both GPU and CPU/MPS)
+        host_cap = None
         try:
             vm = psutil.virtual_memory()
             avail_gb = float(vm.available) / (1024**3)
             host_per_proc = max(0.5, float(args.host_mem_per_proc_gb))
             host_cap = max(1, int(avail_gb // host_per_proc))
             prev = max_workers
-            max_workers = min(max_workers, host_cap)
+            max_workers = min(max_workers, host_cap) if max_workers > 0 else host_cap
             if prev != max_workers:
                 print(f"[AUTOTUNE(host)] avail_ram={avail_gb:.1f}GB per_proc={host_per_proc:.1f}GB -> cap_workers={max_workers}")
         except Exception:
             pass
+
+        # CPU/MPS path: if no GPU IDs, determine workers from CPU cores and RAM
+        if not gpu_ids:
+            try:
+                cores = psutil.cpu_count(logical=True) or os.cpu_count() or 1
+            except Exception:
+                import multiprocessing as _mp
+                cores = _mp.cpu_count() or 1
+            reserve = 1
+            cpu_cap = max(1, int(cores) - reserve)
+            # if host_cap not computed, set a conservative fallback
+            if host_cap is None:
+                host_cap = cpu_cap
+            auto_workers = max(1, min(cpu_cap, host_cap))
+            prev_w = max_workers
+            max_workers = auto_workers
+            # ensure enough queue even if shards was small
+            if shards < max_workers:
+                shards = max_workers
+            if prev_w != max_workers:
+                print(f"[AUTOTUNE(cpu)] cores={cores} -> workers={max_workers} shards={shards}")
+        else:
+            # GPU path: ensure shards provide enough tasks to keep workers busy
+            try:
+                effective_workers = max_workers
+                if shards < effective_workers * 2:
+                    shards = effective_workers * 2
+                    print(f"[AUTOTUNE(queue)] increasing shards to {shards} for better GPU saturation")
+            except Exception:
+                pass
 
     # 動的スケジューリング: チャンクのキューを作成
     chunk_sec = max(30.0, float(args.chunk_sec))
@@ -493,6 +555,7 @@ def main() -> None:
             env = os.environ.copy()
         # safety envs to avoid TRT/CUDA provider conflicts and reduce spam
         env.setdefault("PYTHONUNBUFFERED", "1")
+        env.setdefault("PYTHONNOUSERSITE", "1")  # avoid mixing user-site pkgs (ABI mismatch)
         env.setdefault("ORT_DISABLE_TENSORRT", "1")
         env.setdefault("DISABLE_TRT_EXPORT", "1")
         env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
