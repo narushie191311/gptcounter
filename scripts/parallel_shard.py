@@ -111,6 +111,8 @@ def main() -> None:
     ap.add_argument("--raw-output", default="", help="final merged RAW (non-merged-by-IDs) CSV path. If set, per-chunk raw files are auto-generated and merged here")
     ap.add_argument("--per-chunk-timeout-sec", type=float, default=0.0, help="kill a chunk if it exceeds this wall time (0=disable)")
     ap.add_argument("--prewarm-sec", type=float, default=2.0, help="run a short single analyzer to pre-download models (0=disable)")
+    ap.add_argument("--auto-tune", type=int, default=0, help="auto tune procs-per-gpu from VRAM and mem-per-proc-gb (1=on)")
+    ap.add_argument("--gpu-monitor-sec", type=float, default=20.0, help="print GPU usage every N seconds (0=off)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -212,6 +214,30 @@ def main() -> None:
     if args.gpus.strip():
         gpu_ids = [g.strip() for g in args.gpus.split(",") if g.strip()]
     max_workers = shards if not gpu_ids else min(shards, max(1, len(gpu_ids) * max(1, int(args.procs_per_gpu))))
+
+    # auto-tune procs-per-gpu by VRAM
+    def _read_gpu_total_mem_mb() -> List[int]:
+        try:
+            out = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"], text=True)
+            vals = [int(x.strip()) for x in out.strip().splitlines() if x.strip()]
+            return vals
+        except Exception:
+            return []
+    if args.auto_tune and gpu_ids:
+        totals = _read_gpu_total_mem_mb()
+        if totals:
+            # pick selected GPUs' totals; fallback to min across available
+            try:
+                sel = [totals[int(i)] for i in gpu_ids]
+            except Exception:
+                sel = totals
+            min_mb = min(sel) if sel else 0
+            per_proc_gb = max(0.5, float(args.mem_per_proc_gb))
+            auto_ppg = max(1, int((min_mb / 1024.0) // per_proc_gb))
+            prev = max(1, int(args.procs_per_gpu))
+            suggested = max(prev, auto_ppg)
+            max_workers = min(shards, suggested * len(gpu_ids))
+            print(f"[AUTOTUNE] min_vram={min_mb/1024.0:.1f}GB mem_per_proc_gb={per_proc_gb:.1f} -> procs_per_gpu={suggested} max_workers={max_workers}")
 
     # 動的スケジューリング: チャンクのキューを作成
     chunk_sec = max(30.0, float(args.chunk_sec))
@@ -396,6 +422,29 @@ def main() -> None:
     t_main = time.time()
     processed_sec_completed = 0.0
 
+    # optional GPU monitor
+    stop_monitor = False
+    def _gpu_monitor():
+        while not stop_monitor:
+            try:
+                out = subprocess.check_output(["nvidia-smi", "--query-gpu=index,utilization.gpu,utilization.memory,memory.used,memory.total", "--format=csv,noheader,nounits"], text=True)
+                lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
+                view = []
+                for ln in lines:
+                    parts = [p.strip() for p in ln.split(',')]
+                    if len(parts) >= 5:
+                        view.append(f"id={parts[0]} gpu={parts[1]}% mem={parts[3]}/{parts[4]}MB")
+                if view:
+                    print(f"[GPU] {' | '.join(view)}")
+            except Exception:
+                pass
+            time.sleep(max(1.0, float(args.gpu_monitor_sec)))
+
+    mon_thread = None
+    if args.gpu_monitor_sec and float(args.gpu_monitor_sec) > 0.0:
+        mon_thread = threading.Thread(target=_gpu_monitor, daemon=True)
+        mon_thread.start()
+
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = []
@@ -447,6 +496,8 @@ def main() -> None:
         print("\n[PARALLEL] KeyboardInterrupt received. Waiting for running tasks to terminate...")
         # The streaming function will exit when processes are killed by the environment/user.
         raise
+    finally:
+        stop_monitor = True
     if any(r != 0 for r in rcodes):
         raise SystemExit(f"some shards failed: {rcodes}")
 
