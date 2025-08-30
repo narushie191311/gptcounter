@@ -8,6 +8,8 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from datetime import datetime, timedelta
+import re
 from typing import List, Optional, Tuple
 
 import cv2
@@ -26,6 +28,7 @@ def run_proc_streaming(
     env: Optional[dict] = None,
     cwd: Optional[str] = None,
     per_chunk_timeout_sec: float = 0.0,
+    log_prefix: str = "",
 ) -> int:
     """Run a child analyzer, stream logs to parent, and enforce optional timeout.
 
@@ -46,7 +49,10 @@ def run_proc_streaming(
         assert p.stdout is not None
         for line in iter(p.stdout.readline, ""):
             try:
-                sys.stdout.write(line)
+                if log_prefix:
+                    sys.stdout.write(f"{log_prefix}{line}")
+                else:
+                    sys.stdout.write(line)
                 sys.stdout.flush()
             except Exception:
                 pass
@@ -101,6 +107,7 @@ def main() -> None:
     ap.add_argument("--procs-per-gpu", type=int, default=1, help="parallel processes per GPU")
     ap.add_argument("--skip-existing", type=int, default=1, help="skip chunks already written (1=yes,0=no)")
     ap.add_argument("--online-merge", type=int, default=1, help="enable analyzer online merge (1) or disable (0)")
+    ap.add_argument("--retries", type=int, default=0, help="retry count per chunk on non-zero exit")
     ap.add_argument("--raw-output", default="", help="final merged RAW (non-merged-by-IDs) CSV path. If set, per-chunk raw files are auto-generated and merged here")
     ap.add_argument("--per-chunk-timeout-sec", type=float, default=0.0, help="kill a chunk if it exceeds this wall time (0=disable)")
     ap.add_argument("--prewarm-sec", type=float, default=2.0, help="run a short single analyzer to pre-download models (0=disable)")
@@ -347,7 +354,48 @@ def main() -> None:
         env.setdefault("INSIGHTFACE_HOME", str(Path(project_root) / "models_insightface"))
         return cmd, env
 
+    # helper: parse video start datetime from filename
+    def parse_video_start_datetime(video_path: str) -> Optional[datetime]:
+        name = os.path.basename(video_path)
+        pats = [
+            re.compile(r".*?(\d{8})_(\d{4})-(\d{4})\.[^.]+$"),  # YYYYMMDD_HHMM-HHMM
+            re.compile(r".*?(\d{8})_(\d{4})\.[^.]+$"),           # YYYYMMDD_HHMM
+        ]
+        for pat in pats:
+            m = pat.match(name)
+            if m:
+                ymd = m.group(1)
+                hhmm = m.group(2)
+                try:
+                    return datetime.strptime(ymd + hhmm, "%Y%m%d%H%M")
+                except Exception:
+                    return None
+        return None
+
+    def hhmmss_ms(sec: float) -> str:
+        # format HH:MM:SS.mmm
+        td = timedelta(seconds=max(0.0, float(sec)))
+        # timedelta has microseconds; format to milliseconds
+        total_seconds = int(td.total_seconds())
+        h = total_seconds // 3600
+        m = (total_seconds % 3600) // 60
+        s = total_seconds % 60
+        ms = int((td.total_seconds() - total_seconds) * 1000.0 + 0.5)
+        return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
     # スレッドプールでワークキューを消化（速いワーカーが遅いチャンクを自動的に担当）
+    # resume info summary before dispatch
+    covered_total = 0.0
+    if total_sec > 0 and len(chunks) > 0:
+        # compute covered seconds by scanning existing outputs again (covered list built above)
+        for s, e in covered:
+            covered_total += float(e - s)
+        frac = (covered_total / max(1e-6, total_sec)) * 100.0
+        print(f"[RESUME] covered_spans={len(covered)} covered_sec={covered_total:.1f}s/{total_sec:.1f}s ({frac:.1f}%) remaining_chunks={len(chunks)}")
+
+    t_main = time.time()
+    processed_sec_completed = 0.0
+
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = []
@@ -363,9 +411,38 @@ def main() -> None:
                 cmd, env = make_cmd(s, d, op, gpu_env, raw_op)
                 dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
                 print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
-                futs.append(ex.submit(run_proc_streaming, cmd, env, project_root, float(args.per_chunk_timeout_sec)))
+                prefix = f"[CHUNK s={int(s)} dur={dur_str}] "
+                # wrap with retries
+                def worker(c=cmd, e=env, pref=prefix, start_sec=s, dur=d):
+                    rc = run_proc_streaming(c, e, project_root, float(args.per_chunk_timeout_sec), pref)
+                    tries = 0
+                    while rc != 0 and tries < int(args.retries):
+                        tries += 1
+                        print(f"[RETRY] start={start_sec:.1f}s try={tries} rc={rc}")
+                        rc = run_proc_streaming(c, e, project_root, float(args.per_chunk_timeout_sec) if args.per_chunk_timeout_sec else 0.0, pref)
+                    return (rc, start_sec, dur)
+                futs.append(ex.submit(worker))
             for fut in as_completed(futs):
-                rcodes.append(fut.result())
+                rc, start_sec_done, dur_done = fut.result()
+                rcodes.append(rc)
+                if rc == 0:
+                    # update processed seconds for progress
+                    if total_sec > 0:
+                        span = (total_sec if (dur_done == 0.0 and total_sec > 0) else float(dur_done))
+                        if span > 0:
+                            processed_sec_completed += span
+                    done_frac = ((covered_total + processed_sec_completed) / max(1e-6, total_sec)) * 100.0 if total_sec > 0 else 0.0
+                    elapsed = time.time() - t_main
+                    # estimate speed from warmup if available else from runtime
+                    est_speed = None
+                    try:
+                        est_speed = warm_speed
+                    except Exception:
+                        est_speed = None
+                    if not est_speed:
+                        est_speed = (covered_total + processed_sec_completed) / max(1e-6, elapsed)
+                    remain_sec = (total_sec - (covered_total + processed_sec_completed)) / max(1e-6, est_speed) if total_sec > 0 else 0.0
+                    print(f"[GLOBAL] progress={done_frac:.2f}% elapsed={elapsed/60:.1f}m ETA={remain_sec/60:.1f}m")
     except KeyboardInterrupt:
         print("\n[PARALLEL] KeyboardInterrupt received. Waiting for running tasks to terminate...")
         # The streaming function will exit when processes are killed by the environment/user.
@@ -377,6 +454,7 @@ def main() -> None:
     final_out = os.path.join(out_dir, f"{base_name}_{video_id}_merged.csv")
     with open(final_out, "w", newline="") as fo:
         wrote_header = False
+        video_start_dt = parse_video_start_datetime(args.video)
         # start_sec でソートして結合
         for (s, d, op) in sorted(chunks, key=lambda x: x[0]):
             if not os.path.exists(op):
@@ -384,8 +462,12 @@ def main() -> None:
             with open(op, newline="") as fi:
                 header = fi.readline().rstrip("\n")
                 cols = header.split(",")
+                # 追加列 clock_time を追加（存在しない場合）
                 if not wrote_header:
-                    fo.write(header + "\n")
+                    if "clock_time" not in cols:
+                        fo.write(header + ",clock_time\n")
+                    else:
+                        fo.write(header + "\n")
                     wrote_header = True
                 # 正規化のため列位置を特定
                 try:
@@ -395,16 +477,39 @@ def main() -> None:
                     idx_ts = -1
                     idx_full = -1
                 for line in fi:
-                    if (idx_ts >= 0 and idx_full >= 0):
-                        parts = line.rstrip("\n").split(",")
-                        # ts_from_file_start を timestamp に差し替え
-                        if len(parts) > max(idx_ts, idx_full):
-                            parts[idx_ts] = parts[idx_full]
-                            fo.write(",".join(parts) + "\n")
-                        else:
-                            fo.write(line)
+                    row = line.rstrip("\n")
+                    parts = row.split(",")
+                    # replace timestamp with ts_from_file_start if both exist
+                    if (idx_ts >= 0 and idx_full >= 0) and len(parts) > max(idx_ts, idx_full):
+                        parts[idx_ts] = parts[idx_full]
+                    # compute clock_time from ts_from_file_start
+                    clock_str = ""
+                    try:
+                        base_s = None
+                        if idx_full >= 0 and idx_full < len(parts):
+                            # expected HH:MM:SS.mmm
+                            v = parts[idx_full]
+                            # parse to seconds
+                            h, m, rest = v.split(":")
+                            if "." in rest:
+                                sec, ms = rest.split(".")
+                            else:
+                                sec, ms = rest, "0"
+                            base_s = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
+                        if base_s is not None and video_start_dt is not None:
+                            dt = video_start_dt + timedelta(seconds=float(base_s))
+                            clock_str = dt.strftime("%H:%M:%S.%f")[:-3]
+                        elif base_s is not None:
+                            clock_str = hhmmss_ms(base_s)
+                    except Exception:
+                        clock_str = ""
+                    # append clock_time if header did not include it
+                    if "clock_time" not in cols:
+                        parts_out = ",".join(parts + [clock_str])
                     else:
-                        fo.write(line)
+                        # if file already had clock_time, keep row as is
+                        parts_out = ",".join(parts)
+                    fo.write(parts_out + "\n")
     print(f"[PARALLEL] merged -> {final_out}")
 
     # RAWの結合（ユーザーが要求した場合）
