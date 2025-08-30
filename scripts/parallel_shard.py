@@ -253,6 +253,20 @@ def main() -> None:
                 effective_ppg = min(requested_ppg, auto_ppg)
                 max_workers = min(shards, effective_ppg * len(gpu_ids))
                 print(f"[AUTOTUNE(gpu)] min_free_vram={min_free_mb/1024.0:.1f}GB per_proc={per_proc_gb:.1f}GB -> procs_per_gpu={effective_ppg} max_workers={max_workers}")
+                # Auto-quality selection
+                try:
+                    vram_per_proc_gb = (min_free_mb / 1024.0) / max(1, effective_ppg)
+                except Exception:
+                    vram_per_proc_gb = 0.0
+                if vram_per_proc_gb >= 4.0:
+                    auto_yolo = "yolov8x.pt"; auto_det = "2560x2560"; auto_dn = 1
+                elif vram_per_proc_gb >= 3.0:
+                    auto_yolo = "yolov8l.pt"; auto_det = "2304x2304"; auto_dn = 1
+                elif vram_per_proc_gb >= 2.0:
+                    auto_yolo = "yolov8m.pt"; auto_det = "2048x2048"; auto_dn = 2
+                else:
+                    auto_yolo = "yolov8n.pt"; auto_det = "1536x1536"; auto_dn = 2
+                print(f"[AUTOTUNE(quality)] per_proc_vram={vram_per_proc_gb:.1f}GB -> yolo={auto_yolo} det={auto_det} dN={auto_dn}")
         # Host RAM-based cap
         try:
             vm = psutil.virtual_memory()
@@ -391,8 +405,18 @@ def main() -> None:
         if raw_csv is not None and raw_csv.strip():
             if "--output-csv-raw" not in args.extra_args:
                 cmd += ["--output-csv-raw", raw_csv]
-        if args.extra_args.strip():
-            cmd += args.extra_args.strip().split()
+        # Inject auto-quality defaults if not overridden
+        extra = args.extra_args.strip()
+        def _has_flag(flag: str) -> bool:
+            return (f" {flag} " in f" {extra} ") or extra.startswith(flag) or extra.endswith(flag) or (flag in extra)
+        if 'auto_yolo' in locals() and not _has_flag("--yolo-weights"):
+            cmd += ["--yolo-weights", auto_yolo]
+        if 'auto_det' in locals() and not _has_flag("--det-size"):
+            cmd += ["--det-size", auto_det]
+        if 'auto_dn' in locals() and not _has_flag("--detect-every-n"):
+            cmd += ["--detect-every-n", str(auto_dn)]
+        if extra:
+            cmd += extra.split()
         env = None
         if gpu_env is not None:
             env = os.environ.copy()
