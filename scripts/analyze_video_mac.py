@@ -859,6 +859,9 @@ def analyze_video(
     start_frame_pos = target_frame
 
     # マージ処理の設定
+    print(f"[DEBUG] no_merge flag value: {no_merge}", flush=True)
+    print(f"[DEBUG] merge_every_sec value: {merge_every_sec}", flush=True)
+    
     if no_merge:
         # --no-mergeフラグが指定された場合：特徴量のみ保持、類似度判定なし
         print(f"[INFO] --no-merge flag detected: raw feature extraction mode (no similarity matching)", flush=True)
@@ -1301,24 +1304,25 @@ def analyze_video(
                         except Exception:
                             abs_ts = ""
                     
-                    # CSV行を書き込み
-                    row = [
-                        ts_str,                    # timestamp
-                        ts_from_file_start,        # ts_from_file_start
-                        frame_idx,                 # frame
-                        i,                         # person_id (フレーム内の連番)
-                        i,                         # track_id (フレーム内の連番)
-                        age if age else "",        # age
-                        gender if gender else "",  # gender
-                        fx, fy, fw, fh,           # x, y, w, h
-                        f"{conf:.3f}",            # conf
-                        f"{fsize:.1f}",           # face_size
-                        f"{sharp:.3f}",           # sharpness
-                        emb_b64,                  # embedding_b64
-                        abs_ts,                   # absolute_timestamp
-                        run_started_jst_str,      # run_started_jst
-                    ]
-                    writer.writerow(row)
+                                    # CSV行を書き込み
+                row = [
+                    ts_str,                    # timestamp
+                    ts_from_file_start,        # ts_from_file_start
+                    frame_idx,                 # frame
+                    i,                         # person_id (フレーム内の連番)
+                    i,                         # track_id (フレーム内の連番)
+                    age if age else "",        # age
+                    gender if gender else "",  # gender
+                    fx, fy, fw, fh,           # x, y, w, h
+                    f"{conf:.3f}",            # conf
+                    f"{fsize:.1f}",           # face_size
+                    f"{sharp:.3f}",           # sharpness
+                    emb_b64,                  # embedding_b64
+                    abs_ts,                   # absolute_timestamp
+                    run_started_jst_str,      # run_started_jst
+                ]
+                writer.writerow(row)
+                print(f"[DEBUG] --no-merge: wrote row for frame {frame_idx}, person {i}, age={age}, gender={gender}, conf={conf:.3f}", flush=True)
                 
                 # 統計更新（フレーム単位で軽量更新）
                 for age, gender, _ in det_attrs:
