@@ -610,6 +610,9 @@ def main() -> None:
         extra = args.extra_args.strip()
         print(f"[CMD-INPUT] chunk {start_s}s: extra-args = '{extra}'")
         print(f"[CMD-INPUT] chunk {start_s}s: raw_csv = '{raw_csv}'")
+        print(f"[CMD-INPUT] chunk {start_s}s: raw_csv type = {type(raw_csv)}")
+        print(f"[CMD-INPUT] chunk {start_s}s: raw_csv is None = {raw_csv is None}")
+        print(f"[CMD-INPUT] chunk {start_s}s: raw_csv.strip() = '{raw_csv.strip() if raw_csv else None}'")
         auto_device = None
         try:
             if ("--device" not in extra):
@@ -646,6 +649,9 @@ def main() -> None:
             # オンラインマージ有効時は適度な間隔でマージ
             cmd += ["--merge-every-sec", "30"]
             print(f"[CMD-BUILD] chunk {start_s}s: online-merge mode -> adding --merge-every-sec 30")
+        
+        # 強制的に--no-mergeフラグを除外（データ出力のため）
+        print(f"[CMD-BUILD] chunk {start_s}s: ensuring --no-merge is never added")
         
         # RAWファイル生成の設定
         if raw_csv is not None and raw_csv.strip():
@@ -724,6 +730,10 @@ def main() -> None:
         # 完全なコマンド文字列も表示（デバッグ用）
         cmd_str = " ".join(cmd)
         print(f"[CMD-FULL] chunk {start_s}s: {cmd_str}")
+        # 追加デバッグ：コマンドの詳細
+        print(f"[CMD-DETAIL] chunk {start_s}s: cmd length = {len(cmd)}")
+        print(f"[CMD-DETAIL] chunk {start_s}s: contains --no-merge = {'--no-merge' in cmd}")
+        print(f"[CMD-DETAIL] chunk {start_s}s: contains --merge-every-sec = {'--merge-every-sec' in cmd}")
         
         env = None
         if gpu_env is not None:
