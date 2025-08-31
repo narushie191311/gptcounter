@@ -455,6 +455,10 @@ def main() -> None:
     print(f"[PARALLEL] workers={max_workers}, chunks={len(chunks)} (chunk_sec={int(chunk_sec)}/{int(tail_chunk_sec)})")
     # 既存ファイルスキャンのログ
     print(f"[PARALLEL] work_dir={work_dir} base={base_name} video_id={video_id}")
+    if len(gpu_ids) == 1:
+        print(f"[PARALLEL] NOTE: Using single GPU {gpu_ids[0]} with {max_workers} parallel processes")
+    else:
+        print(f"[PARALLEL] NOTE: Using {len(gpu_ids)} GPUs with {max_workers} total parallel processes")
     # 動画情報と初期のグローバル概要
     if total_sec and total_sec > 0:
         print(f"[VIDEO] duration: {total_sec:.1f}s ({total_sec/60:.1f}m)")
@@ -467,8 +471,9 @@ def main() -> None:
     if args.raw_output.strip():
         print(f"[RAW] will generate per-chunk raw files and merge to: {args.raw_output}")
         if int(args.online_merge) == 0:
-            print(f"[RAW] WARNING: --no-merge may cause empty raw files. Consider using --online-merge 1")
-            print(f"[RAW] INFO: Will auto-enable minimal merging (--merge-every-sec 300) for raw file generation")
+            print(f"[RAW] INFO: --online-merge 0 detected, but RAW files require merging. Auto-enabling --merge-every-sec 300")
+        else:
+            print(f"[RAW] INFO: Using --merge-every-sec 30 for online merging")
 
     # 既存出力スキップ（互換: 旧shard名/新chunk名いずれも読み取り、カバー区間を算出）
     def hhmmss_to_sec(s: str) -> Optional[float]:
@@ -627,18 +632,19 @@ def main() -> None:
             cmd += ["--device", auto_device]
         # オンラインマージの制御（RAWファイル生成のためにも必要）
         if int(args.online_merge) == 0:
-            cmd += ["--no-merge", "--merge-every-sec", "0"]
+            # RAWファイル生成が必要な場合は、--no-mergeを使わずに最小限のマージを有効化
+            if raw_csv is not None and raw_csv.strip():
+                cmd += ["--merge-every-sec", "300"]  # 5分毎にマージ（RAWファイル生成のため）
+            else:
+                cmd += ["--no-merge", "--merge-every-sec", "0"]
         else:
             # オンラインマージ有効時は適度な間隔でマージ
             cmd += ["--merge-every-sec", "30"]
         
-        # RAWファイル生成の強制（--no-mergeでもRAWは生成する）
+        # RAWファイル生成の設定
         if raw_csv is not None and raw_csv.strip():
             if "--output-csv-raw" not in args.extra_args:
                 cmd += ["--output-csv-raw", raw_csv]
-                # RAWファイル生成のため、最低限のマージ処理を有効化
-                if int(args.online_merge) == 0:
-                    cmd += ["--merge-every-sec", "300"]  # 5分毎にマージ
 
         # Inject auto-quality defaults if not overridden
         extra = args.extra_args.strip()
@@ -1159,7 +1165,10 @@ def main() -> None:
             if len(empty_files) > 5:
                 print(f"[RAW-WARN]   ... and {len(empty_files) - 5} more")
             print(f"[RAW-WARN] Total raw files size: {total_size} bytes")
-            print(f"[RAW-WARN] This may indicate --no-merge is preventing proper raw file generation")
+            if int(args.online_merge) == 0:
+                print(f"[RAW-WARN] This may indicate merge settings need adjustment for RAW file generation")
+            else:
+                print(f"[RAW-WARN] This may indicate a processing issue in child processes")
         
         with open(raw_final, "w", newline="") as fo:
             wrote_header_raw = False
