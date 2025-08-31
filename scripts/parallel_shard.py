@@ -256,7 +256,7 @@ def main() -> None:
             need = (total_sec / (args.target_wall_min * 60.0)) / max(1e-6, warm_speed)
             shards = max(1, int(need + 0.999))
         else:
-            shards = 2
+            shards = max(2, int(max_workers) if 'max_workers' in locals() and int(max_workers) > 0 else 2)
         # cap by VRAM
         if torch is not None and torch.cuda.is_available():
             try:
@@ -265,7 +265,7 @@ def main() -> None:
                 shards = min(shards, vram_cap)
             except Exception:
                 pass
-        shards = min(shards, 8)
+        # don't clamp to 8; allow larger shards to fully saturate GPU per desired workers
         # cleanup warmup csv
         try:
             if os.path.exists(tmp_out):
@@ -358,7 +358,14 @@ def main() -> None:
                 # respect user cap but never exceed auto_ppg
                 requested_ppg = max(1, int(args.procs_per_gpu))
                 effective_ppg = min(requested_ppg, auto_ppg)
-                max_workers = min(shards, effective_ppg * len(gpu_ids))
+                # desired concurrent workers from GPU availability
+                desired_workers = max(1, effective_ppg * len(gpu_ids))
+                # if user specified --workers, cap by it; otherwise allow desired
+                user_cap = int(getattr(args, "workers", 0))
+                if user_cap > 0:
+                    desired_workers = min(desired_workers, user_cap)
+                # don't cap by current shards yet; we'll expand shards below if needed
+                max_workers = desired_workers
                 print(f"[AUTOTUNE(gpu)] min_free_vram={min_free_mb/1024.0:.1f}GB per_proc={per_proc_gb:.1f}GB -> procs_per_gpu={effective_ppg} max_workers={max_workers}")
                 # Auto-quality selection
                 try:
