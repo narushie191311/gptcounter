@@ -641,11 +641,11 @@ def main() -> None:
         if int(args.online_merge) == 0:
             # RAWファイル生成が必要な場合は、--no-mergeを使わずに最小限のマージを有効化
             if raw_csv is not None and raw_csv.strip():
-                cmd += ["--merge-every-sec", "300"]  # 5分毎にマージ（RAWファイル生成のため）
-                print(f"[CMD-BUILD] chunk {start_s}s: RAW mode -> adding --merge-every-sec 300 (no --no-merge)")
+                cmd += ["--merge-every-sec", "120"]  # 2分毎にマージ（RAWファイル生成のため、より頻繁に）
+                print(f"[CMD-BUILD] chunk {start_s}s: RAW mode -> adding --merge-every-sec 120 (no --no-merge)")
             else:
-                cmd += ["--merge-every-sec", "60"]  # --no-mergeを使わず、適度なマージを有効化
-                print(f"[CMD-BUILD] chunk {start_s}s: no-RAW mode -> adding --merge-every-sec 60 (no --no-merge)")
+                cmd += ["--merge-every-sec", "30"]  # 30秒毎にマージ（データ出力を確実にする）
+                print(f"[CMD-BUILD] chunk {start_s}s: no-RAW mode -> adding --merge-every-sec 30 (no --no-merge)")
         else:
             # オンラインマージ有効時は適度な間隔でマージ
             cmd += ["--merge-every-sec", "30"]
@@ -747,10 +747,14 @@ def main() -> None:
         env.setdefault("PYTHONNOUSERSITE", "1")  # avoid mixing user-site pkgs (ABI mismatch)
         # MPSで未実装opが出た場合にCPUフォールバックを許可
         env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        # TensorRTとCUDA関連の環境変数を強化して初期化エラーを防止
         env.setdefault("ORT_DISABLE_TENSORRT", "1")
         env.setdefault("DISABLE_TRT_EXPORT", "1")
         env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
         env.setdefault("CUDA_MODULE_LOADING", "LAZY")
+        env.setdefault("CUDA_LAUNCH_BLOCKING", "0")  # CUDA初期化エラーを防ぐ
+        env.setdefault("CUDA_CACHE_DISABLE", "1")    # CUDAキャッシュを無効化
+        env.setdefault("CUDA_FORCE_PTX_JIT", "0")   # PTX JITを無効化
         env.setdefault("INSIGHTFACE_HOME", str(Path(project_root) / "models_insightface"))
         return cmd, env
 

@@ -81,9 +81,17 @@ def init_face_app(det_w: int = 640, det_h: int = 640, device: str = "auto", face
     requested_cuda = device.lower() in ("cuda", "gpu")
     cuda_available = torch.cuda.is_available()
     providers_try = []
+    
+    # CUDA初期化エラーが発生した場合のフォールバック処理
     if requested_cuda or (device.lower() == "auto" and cuda_available):
-        providers_try.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
-    providers_try.append(["CPUExecutionProvider"])  # フォールバック
+        try:
+            # まずCUDAプロバイダーを試行
+            providers_try.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
+        except Exception:
+            print(f"[WARN] CUDA初期化に失敗、CPUにフォールバックします", flush=True)
+            providers_try.append(["CPUExecutionProvider"])
+    
+    providers_try.append(["CPUExecutionProvider"])  # 最終フォールバック
 
     last_err = None
     for prov in providers_try:
@@ -91,10 +99,22 @@ def init_face_app(det_w: int = 640, det_h: int = 640, device: str = "auto", face
             app = FaceAnalysis(name=str(face_model or "buffalo_l"), root=INSIGHTFACE_ROOT, providers=prov)
             ctx_id = 0 if ("CUDAExecutionProvider" in prov and cuda_available) else -1
             app.prepare(ctx_id=ctx_id, det_size=(det_w, det_h))
+            print(f"[INFO] FaceAnalysis初期化成功: providers={prov}", flush=True)
             return app
         except Exception as e:  # noqa: BLE001
             last_err = e
-    raise RuntimeError(f"FaceAnalysis初期化に失敗: {last_err}")
+            print(f"[WARN] FaceAnalysis初期化失敗 (providers={prov}): {e}", flush=True)
+            continue
+    
+    # 最後の手段としてCPUのみで試行
+    try:
+        print(f"[INFO] 最終フォールバック: CPUのみでFaceAnalysis初期化を試行", flush=True)
+        app = FaceAnalysis(name=str(face_model or "buffalo_l"), root=INSIGHTFACE_ROOT, providers=["CPUExecutionProvider"])
+        app.prepare(ctx_id=-1, det_size=(det_w, det_h))
+        print(f"[INFO] FaceAnalysis初期化成功: CPUフォールバック", flush=True)
+        return app
+    except Exception as final_e:
+        raise RuntimeError(f"FaceAnalysis初期化に完全に失敗: {final_e} (最後のエラー: {last_err})")
 
 
 def init_person_detector(device: str = "auto", trt_engine: Optional[str] = None, yolo_weights: str = "yolov8n.pt") -> YOLO:
@@ -105,23 +125,58 @@ def init_person_detector(device: str = "auto", trt_engine: Optional[str] = None,
         try:
             model = YOLO(trt_engine)
         except Exception:
+            print(f"[WARN] TensorRTエンジン読み込み失敗: {trt_engine}", flush=True)
             model = None
+    
     if model is None:
-        model = YOLO(yolo_weights)
+        try:
+            model = YOLO(yolo_weights)
+            print(f"[INFO] YOLOモデル読み込み成功: {yolo_weights}", flush=True)
+        except Exception as e:
+            print(f"[ERROR] YOLOモデル読み込み失敗: {e}", flush=True)
+            raise RuntimeError(f"YOLOモデル初期化に失敗: {e}")
+    
+    # デバイス選択とフォールバック処理
     use_cuda = (device.lower() in ("cuda", "gpu")) or (device.lower() == "auto" and torch.cuda.is_available())
     use_mps = (device.lower() == "mps") or (device.lower() == "auto" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+    
     try:
         if use_cuda:
-            model.to("cuda")
+            try:
+                model.to("cuda")
+                print(f"[INFO] YOLOモデルをCUDAに移動成功", flush=True)
+            except Exception as cuda_e:
+                print(f"[WARN] CUDA移動失敗、CPUにフォールバック: {cuda_e}", flush=True)
+                model.to("cpu")
+                use_cuda = False
         elif use_mps:
-            model.to("mps")
+            try:
+                model.to("mps")
+                print(f"[INFO] YOLOモデルをMPSに移動成功", flush=True)
+            except Exception as mps_e:
+                print(f"[WARN] MPS移動失敗、CPUにフォールバック: {mps_e}", flush=True)
+                model.to("cpu")
+                use_mps = False
+        else:
+            model.to("cpu")
+            print(f"[INFO] YOLOモデルをCPUに配置", flush=True)
+        
         # Conv+BNの融合で僅かな高速化
         try:
             model.fuse()
+            print(f"[INFO] YOLOモデルの融合処理完了", flush=True)
         except Exception:
+            print(f"[WARN] YOLOモデルの融合処理スキップ", flush=True)
             pass
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] デバイス移動処理でエラー: {e}", flush=True)
+        # 最後の手段としてCPUに配置
+        try:
+            model.to("cpu")
+            print(f"[INFO] 最終フォールバック: YOLOモデルをCPUに配置", flush=True)
+        except Exception as final_e:
+            print(f"[ERROR] CPU配置も失敗: {final_e}", flush=True)
+    
     return model
 
 
@@ -145,7 +200,11 @@ def configure_cuda_runtime() -> None:
         pass
 
 
-def ensure_trt_engine(yolo_weights: Optional[str], prefer_half: bool = True) -> Optional[str]:
+def ensure_trt_engine(yolo_weights: Optional[str], prefer_half: bool = True, no_trt_export: bool = False) -> Optional[str]:
+    # --no-trt-exportフラグが設定されている場合はTensorRTエクスポートを完全にスキップ
+    if no_trt_export:
+        return None
+    
     try:
         if not yolo_weights or not os.path.exists(yolo_weights):
             return None
@@ -633,18 +692,34 @@ def analyze_video(
     reid_backend: str = "hist",
     gait_features: bool = False,
     global_start_sec: float = 0.0,
+    no_trt_export: bool = False,
 ) -> None:
     # 現在の可変パラメータ（オートチューニング対象）
     current_det_w, current_det_h = int(det_size[0]), int(det_size[1])
     current_detect_every_n = int(detect_every_n)
 
+    # CUDA初期化エラーが発生した場合のフォールバック処理
+    original_device = device
+    try:
+        if device.lower() in ("cuda", "auto") and torch.cuda.is_available():
+            # CUDA初期化テスト
+            torch.cuda.init()
+            torch.cuda.empty_cache()
+            print(f"[INFO] CUDA初期化テスト成功: {torch.cuda.get_device_name(0)}", flush=True)
+    except Exception as cuda_init_e:
+        print(f"[WARN] CUDA初期化失敗、CPUにフォールバック: {cuda_init_e}", flush=True)
+        device = "cpu"
+        print(f"[INFO] デバイスをCPUに変更: {original_device} -> {device}", flush=True)
+
     # Face/YOLO 初期化
     face_app = init_face_app(det_w=current_det_w, det_h=current_det_h, device=device, face_model=face_model)
     if trt_engine is None and yolo_weights and (device.lower() in ("cuda", "auto")) and torch.cuda.is_available():
-        built_engine = ensure_trt_engine(yolo_weights)
+        built_engine = ensure_trt_engine(yolo_weights, no_trt_export=no_trt_export)
         if built_engine:
             trt_engine = built_engine
             print(f"[TRT] Using TensorRT engine: {trt_engine}", flush=True)
+        elif no_trt_export:
+            print(f"[TRT] TensorRT export skipped due to --no-trt-export flag", flush=True)
     yolo = init_person_detector(device=device, trt_engine=trt_engine, yolo_weights=(yolo_weights or "yolov8n.pt"))
     # optional trackers
     bytetrack = None
@@ -1604,6 +1679,7 @@ def main() -> None:
         reid_backend=args.reid_backend,
         gait_features=args.gait_features,
         global_start_sec=args.global_start_sec,
+        no_trt_export=args.no_trt_export,
     )
 
 
