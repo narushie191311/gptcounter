@@ -25,6 +25,25 @@ def sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:100]
 
 
+def safe_symlink(src: str, dst: str) -> bool:
+    """シンボリックリンクが作れない環境のフォールバック"""
+    try:
+        if os.path.exists(dst):
+            os.remove(dst)
+        os.symlink(src, dst)
+        return True
+    except (OSError, NotImplementedError):
+        # シンボリックリンクが作れない場合はコピー
+        try:
+            import shutil
+            shutil.copy2(src, dst)
+            print(f"[SYMLINK-FALLBACK] シンボリックリンク不可 → ファイルコピー: {dst}")
+            return True
+        except Exception as e:
+            print(f"[SYMLINK-ERROR] リンク・コピー両方失敗: {e}")
+            return False
+
+
 def run_proc_streaming(
     cmd: List[str],
     env: Optional[dict] = None,
@@ -429,31 +448,36 @@ def main() -> None:
     chunk_sec = max(30.0, float(args.chunk_sec))
     tail_chunk_sec = max(30.0, float(args.tail_chunk_sec))
     chunks: List[Tuple[float, float, str]] = []  # (start_sec, duration_sec, out_path)
-    raw_chunks: List[Tuple[float, float, str]] = []  # raw csv paths parallel to chunks
+    raw_by_start: Dict[int, str] = {}  # start_sec -> raw_csv_path mapping
     cur = 0.0
     idx = 0
     # 末尾20%は小さめのチャンク
     tail_start = total_sec * 0.8 if total_sec > 0 else 0
+    overlap_sec = 2.0  # チャンク境界のオーバーラップ（検出/追跡の切れを防ぐ）
     while cur < total_sec or (total_sec == 0 and idx == 0):
         this_chunk = tail_chunk_sec if (total_sec > 0 and cur >= tail_start) else chunk_sec
         dur = this_chunk if (total_sec <= 0 or cur + this_chunk < total_sec) else max(0.0, total_sec - cur)
         start_s = max(0.0, cur)
         # 最終チャンクは末尾まで（duration=0）
-        if total_sec > 0 and cur + chunk_sec >= total_sec:
+        if total_sec > 0 and cur + this_chunk >= total_sec:
             dur = 0.0
+        else:
+            # 末尾以外のチャンクにオーバーラップを追加
+            dur += overlap_sec
+        
         out_path = os.path.join(work_dir, f"{base_name}_chunk_{int(start_s)}s.csv")
         chunks.append((start_s, dur, out_path))
-        # per-chunk RAW path if requested
+        # per-chunk RAW path if requested (using start_sec as key)
         if args.raw_output.strip():
             raw_name = os.path.join(work_dir, f"{base_name}_raw_chunk_{int(start_s)}s.csv")
-            raw_chunks.append((start_s, dur, raw_name))
+            raw_by_start[int(start_s)] = raw_name
         if dur == 0.0:
             break
         cur += this_chunk
         idx += 1
 
     print(f"[PARALLEL] workers={max_workers}, chunks={len(chunks)} (chunk_sec={int(chunk_sec)}/{int(tail_chunk_sec)})")
-    print(f"[PARALLEL] raw_chunks={len(raw_chunks)} (raw_output='{args.raw_output}')")
+    print(f"[PARALLEL] raw_by_start={len(raw_by_start)} (raw_output='{args.raw_output}')")
     # 既存ファイルスキャンのログ
     print(f"[PARALLEL] work_dir={work_dir} base={base_name} video_id={video_id}")
     if len(gpu_ids) == 1:
@@ -606,7 +630,7 @@ def main() -> None:
         adjusted.append((new_s, new_d, op))
     chunks = adjusted
     rcodes = []
-    def make_cmd(start_s: float, dur_s: float, out_csv: str, gpu_env: Optional[str], raw_csv: Optional[str]) -> Tuple[List[str], Optional[dict]]:
+    def make_cmd(start_s: float, dur_s: float, out_csv: str, gpu_env: Optional[str], raw_csv: Optional[str], auto_yolo: Optional[str] = None, auto_det: Optional[str] = None, auto_dn: Optional[int] = None) -> Tuple[List[str], Optional[dict]]:
         # Auto device selection when user didn't specify in extra-args
         extra = args.extra_args.strip()
         print(f"[CMD-INPUT] chunk {start_s}s: extra-args = '{extra}'")
@@ -660,7 +684,6 @@ def main() -> None:
                 cmd += ["--output-csv-raw", raw_csv]
 
         # Inject auto-quality defaults if not overridden
-        # extra変数は既に上で定義済みなので、ここでは再定義しない
         def _has_flag(flag: str) -> bool:
             """Return True if the flag (e.g., "--det-size") is present in extra-args tokens.
             This performs exact token checks and also matches "--flag=value" forms.
@@ -679,12 +702,17 @@ def main() -> None:
                 if tok.startswith(flag + "="):
                     return True
             return False
-        if 'auto_yolo' in locals() and not _has_flag("--yolo-weights"):
+        
+        # Auto-quality injection (using function parameters instead of locals())
+        if auto_yolo and not _has_flag("--yolo-weights"):
             cmd += ["--yolo-weights", auto_yolo]
-        if 'auto_det' in locals() and not _has_flag("--det-size"):
+            print(f"[CMD-AUTO] chunk {start_s}s: injected --yolo-weights {auto_yolo}")
+        if auto_det and not _has_flag("--det-size"):
             cmd += ["--det-size", auto_det]
-        if 'auto_dn' in locals() and not _has_flag("--detect-every-n"):
+            print(f"[CMD-AUTO] chunk {start_s}s: injected --det-size {auto_det}")
+        if auto_dn is not None and not _has_flag("--detect-every-n"):
             cmd += ["--detect-every-n", str(auto_dn)]
+            print(f"[CMD-AUTO] chunk {start_s}s: injected --detect-every-n {auto_dn}")
         
         # フィルタリングされたextra-argsを追加（マージ関連のフラグを除外）
         if extra:
@@ -755,6 +783,10 @@ def main() -> None:
         env.setdefault("CUDA_LAUNCH_BLOCKING", "0")  # CUDA初期化エラーを防ぐ
         env.setdefault("CUDA_CACHE_DISABLE", "1")    # CUDAキャッシュを無効化
         env.setdefault("CUDA_FORCE_PTX_JIT", "0")   # PTX JITを無効化
+        # Colab向け追加最適化
+        env.setdefault("OMP_NUM_THREADS", "4")  # CPUスレッド過多抑制
+        env.setdefault("MKL_NUM_THREADS", "4")
+        env.setdefault("OPENBLAS_NUM_THREADS", "4")
         env.setdefault("INSIGHTFACE_HOME", str(Path(project_root) / "models_insightface"))
         return cmd, env
 
@@ -842,16 +874,20 @@ def main() -> None:
                                 chunk_idx = i
                                 break
                         
-                        if chunk_idx is not None and chunk_idx < len(raw_chunks):
-                            raw_path = raw_chunks[chunk_idx][2]
-                            if os.path.exists(raw_path):
-                                size = os.path.getsize(raw_path)
-                                with open(raw_path, 'r') as f:
-                                    lines = f.readlines()
-                                    rows = max(0, len(lines) - 1)  # ヘッダーを除く
-                                
-                                # 進捗が25%、50%、75%の時にRAWファイル状況をログ出力
-                                if perc in [0.25, 0.5, 0.75] or (perc > 0.9 and perc < 0.95):
+                        # 対応するRAWファイルの状況をチェック（start_secで直接検索）
+                        raw_path = raw_by_start.get(int(start_key))
+                        if raw_path and os.path.exists(raw_path):
+                            size = os.path.getsize(raw_path)
+                            with open(raw_path, 'r') as f:
+                                lines = f.readlines()
+                                rows = max(0, len(lines) - 1)  # ヘッダーを除く
+                            
+                                                            # 進捗が25%、50%、75%の時にRAWファイル状況をログ出力（近傍閾値で判定）
+                                for th in (0.25, 0.5, 0.75):
+                                    if abs(perc - th) < 0.03:  # ±3%幅
+                                        print(f"[RAW-PROGRESS] chunk {start_key}s ({perc*100:.0f}%): {size:,} bytes, {rows:,} rows")
+                                        break
+                                if perc > 0.9 and perc < 0.95:
                                     print(f"[RAW-PROGRESS] chunk {start_key}s ({perc*100:.0f}%): {size:,} bytes, {rows:,} rows")
                     except Exception as e:
                         pass  # エラーは静かに無視
@@ -866,8 +902,15 @@ def main() -> None:
                             if sec > prev:
                                 chunk_state[str(int(start_key))] = sec
                                 try:
-                                    with open(resume_state_path, "w") as wf:
-                                        json.dump(chunk_state, wf)
+                                    # progress.json を原子的置換
+                                    import tempfile
+                                    d = os.path.dirname(resume_state_path) or "."
+                                    fd, tmp = tempfile.mkstemp(prefix=".tmp", dir=d)
+                                    with os.fdopen(fd, "w") as wf:
+                                        json.dump(chunk_state, wf, ensure_ascii=False, indent=2)
+                                        wf.flush()
+                                        os.fsync(wf.fileno())
+                                    os.replace(tmp, resume_state_path)  # atomic
                                 except Exception:
                                     pass
                     except Exception:
@@ -976,9 +1019,9 @@ def main() -> None:
                     break
 
     # optional GPU monitor
-    stop_monitor = False
+    stop_gpu_monitor = False
     def _gpu_monitor():
-        while not stop_monitor:
+        while not stop_gpu_monitor:
             try:
                 out = subprocess.check_output(["nvidia-smi", "--query-gpu=index,utilization.gpu,utilization.memory,memory.used,memory.total", "--format=csv,noheader,nounits"], text=True)
                 lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
@@ -1010,12 +1053,12 @@ def main() -> None:
                     gpu_env = gpu_ids[i % len(gpu_ids)]
                 raw_op = None
                 if args.raw_output.strip():
-                    # align by index since we appended in parallel above
-                    raw_op = raw_chunks[i][2] if i < len(raw_chunks) else None
-                    print(f"[RAW-DEBUG] chunk {s}s: raw_output='{args.raw_output}', raw_chunks[{i}]={raw_chunks[i] if i < len(raw_chunks) else 'OUT_OF_RANGE'}, raw_op='{raw_op}'")
+                    # use start_sec to look up raw file path
+                    raw_op = raw_by_start.get(int(s))
+                    print(f"[RAW-DEBUG] chunk {s}s: raw_output='{args.raw_output}', start_sec={int(s)}, raw_op='{raw_op}'")
                 else:
                     print(f"[RAW-DEBUG] chunk {s}s: raw_output is empty, raw_op=None")
-                cmd, env = make_cmd(s, d, op, gpu_env, raw_op)
+                cmd, env = make_cmd(s, d, op, gpu_env, raw_op, auto_yolo, auto_det, auto_dn)
                 dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
                 print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
                 prefix = f"[CHUNK s={int(s)} dur={dur_str}] "
@@ -1040,7 +1083,7 @@ def main() -> None:
                         timeout_sec = max(600.0, exp_wall * 3.0)  # 3倍の余裕
                     with lock:
                         start_wall_map[start_sec] = time.time()
-                    rc = run_proc_streaming(c, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)) or True)
+                    rc = run_proc_streaming(c, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)))
                     tries = 0
                     while rc != 0 and tries < int(args.retries):
                         tries += 1
@@ -1066,7 +1109,7 @@ def main() -> None:
                         # 次回タイムアウトも動的
                         with lock:
                             start_wall_map[start_sec] = time.time()
-                        rc = run_proc_streaming(c2, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)) or True)
+                        rc = run_proc_streaming(c2, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)))
                     return (rc, start_sec, dur, out_path)
                 futs.append(ex.submit(worker))
             for fut in as_completed(futs):
@@ -1126,7 +1169,7 @@ def main() -> None:
         # The streaming function will exit when processes are killed by the environment/user.
         raise
     finally:
-        stop_monitor = True
+        stop_gpu_monitor = True  # GPU監視のみ停止
     if any(r != 0 for r in rcodes):
         if int(args.allow_partial) == 1:
             print(f"[WARN] some shards failed but allow-partial=1: {rcodes}")
@@ -1134,12 +1177,13 @@ def main() -> None:
             raise SystemExit(f"some shards failed: {rcodes}")
 
     # RAWファイルの進捗監視とログ出力
+    stop_raw_monitor = False
     def monitor_raw_progress():
         """RAWファイルの進捗を定期的に監視し、詳細なログを出力"""
         last_check = time.time()
         check_interval = 30.0  # 30秒毎にチェック
         
-        while not stop_monitor:
+        while not stop_raw_monitor:
             try:
                 time.sleep(1.0)  # 1秒毎にチェック
                 now = time.time()
@@ -1152,8 +1196,10 @@ def main() -> None:
                     total_raw_rows = 0
                     active_chunks = 0
                     
-                    for i, (s, d, rp) in enumerate(raw_chunks):
-                        if os.path.exists(rp):
+                    # 各RAWファイルの状況をチェック（start_secで直接検索）
+                    for s, d, _ in chunks:
+                        rp = raw_by_start.get(int(s))
+                        if rp and os.path.exists(rp):
                             try:
                                 size = os.path.getsize(rp)
                                 total_raw_size += size
@@ -1168,7 +1214,7 @@ def main() -> None:
                                     active_chunks += 1
                                     
                                 # 個別チャンクの詳細ログ（最初の5個のみ）
-                                if i < 5:
+                                if active_chunks <= 5:
                                     print(f"[RAW-PROGRESS] chunk {s}s: {size} bytes, {rows} rows")
                                     
                             except Exception as e:
@@ -1177,8 +1223,9 @@ def main() -> None:
                     # 全体の進捗サマリー
                     elapsed = now - t_main
                     if total_sec > 0:
-                        processed_frac = (total_done / total_sec) * 100 if 'total_done' in locals() else 0.0
-                        print(f"[RAW-SUMMARY] {elapsed/60:.1f}m elapsed: {total_raw_size:,} bytes, {total_raw_rows:,} rows, {active_chunks}/{len(raw_chunks)} active chunks ({processed_frac:.1f}% processed)")
+                        # 共有辞書で進捗を共有
+                        processed_frac = 100.0 * (processed_sec_completed / total_sec) if total_sec > 0 else 0.0
+                        print(f"[RAW-SUMMARY] {elapsed/60:.1f}m elapsed: {total_raw_size:,} bytes, {total_raw_rows:,} rows, {active_chunks}/{len(chunks)} active chunks ({processed_frac:.1f}% processed)")
                     
             except Exception as e:
                 print(f"[RAW-MONITOR-ERROR] {e}")
@@ -1191,12 +1238,22 @@ def main() -> None:
         raw_monitor_thread.start()
         print(f"[RAW-MONITOR] Started RAW file progress monitoring (30s intervals)")
     
+    # RAW監視スレッドの停止処理を最後に実行
+    try:
+        # RAWマージ処理など一連の処理が完了した後で停止
+        if raw_monitor_thread and raw_monitor_thread.is_alive():
+            stop_raw_monitor = True
+            raw_monitor_thread.join(timeout=5.0)  # 5秒でタイムアウト
+    except Exception as e:
+        print(f"[RAW-MONITOR] Error stopping monitor thread: {e}")
+    
     # 連結（ヘッダは先頭のみ）かつ timestamp を動画全体の相対に正規化
     final_out = os.path.join(out_dir, f"{base_name}_{video_id}_merged.csv")
     with open(final_out, "w", newline="") as fo:
         wrote_header = False
         video_start_dt = parse_video_start_datetime(args.video)
-        # start_sec でソートして結合
+        # start_sec でソートして結合（オーバーラップによる重複を除外）
+        last_ts = None  # 重複除外用の前回タイムスタンプ
         for (s, d, op) in sorted(chunks, key=lambda x: x[0]):
             if not os.path.exists(op):
                 continue
@@ -1223,6 +1280,26 @@ def main() -> None:
                     # replace timestamp with ts_from_file_start if both exist
                     if (idx_ts >= 0 and idx_full >= 0) and len(parts) > max(idx_ts, idx_full):
                         parts[idx_ts] = parts[idx_full]
+                    
+                    # オーバーラップによる重複除外（±100ms以内なら除外）
+                    current_ts = None
+                    try:
+                        if idx_full >= 0 and idx_full < len(parts):
+                            v = parts[idx_full]
+                            h, m, rest = v.split(":")
+                            if "." in rest:
+                                sec, ms = rest.split(".")
+                            else:
+                                sec, ms = rest, "0"
+                            current_ts = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
+                    except Exception:
+                        pass
+                    
+                    # 重複除外チェック
+                    if current_ts is not None and last_ts is not None:
+                        if abs(current_ts - last_ts) < 0.1:  # ±100ms以内
+                            continue  # 重複行をスキップ
+                    
                     # compute clock_time from ts_from_file_start
                     clock_str = ""
                     try:
@@ -1244,13 +1321,19 @@ def main() -> None:
                             clock_str = hhmmss_ms(base_s)
                     except Exception:
                         clock_str = ""
+                    
                     # append clock_time if header did not include it
                     if "clock_time" not in cols:
                         parts_out = ",".join(parts + [clock_str])
                     else:
                         # if file already had clock_time, keep row as is
                         parts_out = ",".join(parts)
+                    
                     fo.write(parts_out + "\n")
+                    
+                    # 重複除外用のタイムスタンプ更新
+                    if current_ts is not None:
+                        last_ts = current_ts
     print(f"[PARALLEL] merged -> {final_out}")
 
     # Coverage verification for merged final CSV

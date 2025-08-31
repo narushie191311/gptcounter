@@ -44,6 +44,11 @@ from scipy.optimize import linear_sum_assignment
 import base64
 
 
+def warn(tag: str, e: Exception) -> None:
+    """例外を pass せず短いエラー種＋要点だけ出す関数"""
+    print(f"[WARN][{tag}] {type(e).__name__}: {e}", flush=True)
+
+
 INSIGHTFACE_ROOT = os.path.join(os.path.dirname(__file__), "..", "models_insightface")
 os.makedirs(INSIGHTFACE_ROOT, exist_ok=True)
 
@@ -167,6 +172,18 @@ def init_person_detector(device: str = "auto", trt_engine: Optional[str] = None,
             print(f"[INFO] YOLOモデルの融合処理完了", flush=True)
         except Exception:
             print(f"[WARN] YOLOモデルの融合処理スキップ", flush=True)
+            pass
+        
+        # CUDA で動ける時はモデル自体も half 化（V8系はだいたいOK）
+        try:
+            if use_cuda:
+                try:
+                    model.model.half()
+                    print(f"[INFO] YOLOモデルをFP16化成功", flush=True)
+                except Exception:
+                    print(f"[WARN] YOLOモデルのFP16化スキップ", flush=True)
+                    pass
+        except Exception:
             pass
     except Exception as e:
         print(f"[WARN] デバイス移動処理でエラー: {e}", flush=True)
@@ -407,6 +424,40 @@ def detect_faces_and_attrs(face_app: FaceAnalysis, frame: np.ndarray, conf_thres
     return results
 
 
+def detect_faces_roi(face_app: FaceAnalysis, frame: np.ndarray, person_boxes: List[Tuple[Tuple[int, int, int, int], float]], conf_threshold: float = 0.5):
+    """ROIベースの顔検出（人数が多い時に効率的）"""
+    results = []
+    for (px, py, pw, ph), _ in person_boxes:
+        x1, y1 = max(0, px), max(0, py)
+        x2, y2 = min(frame.shape[1], px+pw), min(frame.shape[0], py+ph)
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0: 
+            continue
+        faces = face_app.get(roi)
+        for f in faces:
+            score = float(getattr(f, "det_score", 0.0))
+            if score < conf_threshold: 
+                continue
+            fx1, fy1, fx2, fy2 = map(int, f.bbox)
+            w, h = max(0, fx2-fx1), max(0, fy2-fy1)
+            if w <= 0 or h <= 0:
+                continue
+            gender_str = "Male" if getattr(f, "gender", 0) == 1 else "Female"
+            age_val = int(getattr(f, "age", 0))
+            emb = getattr(f, "normed_embedding", None)
+            if emb is None:
+                emb = getattr(f, "embedding", None)
+                if emb is not None:
+                    emb = np.asarray(emb, dtype=np.float32)
+                    n = float(np.linalg.norm(emb) + 1e-6)
+                    emb = emb / n
+            if emb is not None:
+                emb = np.asarray(emb, dtype=np.float32)
+            # ROI座標を元のフレーム座標に変換
+            results.append(((x1+fx1, y1+fy1, w, h), score, age_val, gender_str, emb))
+    return results
+
+
 def iou(boxA: Tuple[int, int, int, int], boxB: Tuple[int, int, int, int]) -> float:
     ax, ay, aw, ah = boxA
     bx, by, bw, bh = boxB
@@ -432,8 +483,6 @@ class Track:
     embedding: Optional[np.ndarray] = None
     embedding_count: int = 0
     person_id: Optional[int] = None
-    embedding: Optional[np.ndarray] = None
-    embedding_count: int = 0
 
 
 class PersonRegistry:
@@ -947,7 +996,7 @@ def analyze_video(
             except Exception:
                 continue
 
-    csv_file = open(effective_csv_path, ("a" if resume_mode else "w"), newline="")
+    csv_file = open(effective_csv_path, ("a" if resume_mode else "w"), newline="", buffering=1024*1024)  # 1MBバッファでIO負荷軽減
     writer = csv.writer(csv_file)
     # 実行開始時刻（JST）を列に保持（各行に同値を書き込む）
     run_started_utc = datetime.now(timezone.utc)
@@ -1195,7 +1244,15 @@ def analyze_video(
             confidences: List[float] = []
             det_attrs: List[Tuple[int, str, Optional[np.ndarray]]] = []  # (age, gender, fused_emb)
             if do_detect:
-                dets = detect_faces_and_attrs(face_app, frame, conf_threshold=conf_threshold)
+                # ROI Face（人数が多い時に自動切替）
+                MAX_FULLFRAME_FACES = 6  # この人数を超えたら ROI モード
+                use_roi_face = len(person_boxes) >= MAX_FULLFRAME_FACES
+                
+                if use_roi_face:
+                    print(f"[ROI-FACE] 人数多({len(person_boxes)}) → ROI Face モード切替", flush=True)
+                    dets = detect_faces_roi(face_app, frame, person_boxes, conf_threshold=conf_threshold)
+                else:
+                    dets = detect_faces_and_attrs(face_app, frame, conf_threshold=conf_threshold)
                 # YOLOの入力解像度を顔検出サイズと揃える（短辺基準）
                 short_side = min(current_det_w, current_det_h)
                 yolo_use_half = torch.cuda.is_available() and (device.lower() in ("auto", "cuda", "gpu"))
@@ -1271,9 +1328,8 @@ def analyze_video(
             
             # --no-mergeモードの場合：トラッキングをスキップして直接CSVに書き込み
             if no_merge:
-                # 検出された顔を直接CSVに書き込み（トラッキング・マージなし）
+                # 検出された各顔を直接CSVに書く（1検出=1行）
                 for i, ((fx, fy, fw, fh), conf, (age, gender, fused)) in enumerate(zip(boxes, confidences, det_attrs)):
-                    # 顔品質メトリクス計算
                     fsize, sharp = 0.0, 0.0
                     try:
                         crop_gray = cv2.cvtColor(frame[fy:fy+fh, fx:fx+fw], cv2.COLOR_BGR2GRAY)
@@ -1281,21 +1337,17 @@ def analyze_video(
                         fsize = float(fw * fh)
                     except Exception:
                         pass
-                    
-                    # 埋め込みベクトルをbase64エンコード
                     emb_b64 = ""
                     if fused is not None:
                         try:
-                            emb_b64 = base64.b64encode(np.asarray(fused, dtype=np.float32).tobytes()).decode("ascii")
+                            # 量子化で軽量化（float32 → float16 で約半分に）
+                            vec16 = np.asarray(fused, dtype=np.float16)
+                            emb_b64 = base64.b64encode(vec16.tobytes()).decode("ascii")
                         except Exception:
                             emb_b64 = ""
-                    
-                    # タイムスタンプ計算
                     relative_sec = current_time_sec - start_sec
                     ts_str = format_timestamp(relative_sec)
                     ts_from_file_start = format_timestamp(current_time_sec + global_start_sec)
-                    
-                    # 絶対時刻（JST）
                     abs_ts = ""
                     if video_dt is not None:
                         try:
@@ -1303,54 +1355,34 @@ def analyze_video(
                             abs_ts = abs_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                         except Exception:
                             abs_ts = ""
-                    
-                                    # CSV行を書き込み
-                row = [
-                    ts_str,                    # timestamp
-                    ts_from_file_start,        # ts_from_file_start
-                    frame_idx,                 # frame
-                    i,                         # person_id (フレーム内の連番)
-                    i,                         # track_id (フレーム内の連番)
-                    age if age else "",        # age
-                    gender if gender else "",  # gender
-                    fx, fy, fw, fh,           # x, y, w, h
-                    f"{conf:.3f}",            # conf
-                    f"{fsize:.1f}",           # face_size
-                    f"{sharp:.3f}",           # sharpness
-                    emb_b64,                  # embedding_b64
-                    abs_ts,                   # absolute_timestamp
-                    run_started_jst_str,      # run_started_jst
-                ]
-                writer.writerow(row)
-                print(f"[DEBUG] --no-merge: wrote row for frame {frame_idx}, person {i}, age={age}, gender={gender}, conf={conf:.3f}", flush=True)
+                    row = [
+                        ts_str, ts_from_file_start, frame_idx,
+                        i, i,
+                        age if age else "", gender if gender else "",
+                        fx, fy, fw, fh,
+                        f"{conf:.3f}",
+                        f"{fsize:.1f}", f"{sharp:.3f}",
+                        emb_b64, abs_ts, run_started_jst_str,
+                    ]
+                    writer.writerow(row)
+                    print(f"[DEBUG] --no-merge: wrote row for frame {frame_idx}, person {i}, age={age}, gender={gender}, conf={conf:.3f}", flush=True)
                 
                 # 統計更新（フレーム単位で軽量更新）
                 for age, gender, _ in det_attrs:
                     stats.update(age, gender)
                 
-                # フレーム処理後にCSVをフラッシュ（データ損失防止）
+                # 1フレーム内の各検出を即時反映
                 if frame_idx % flush_every_n == 0:
                     csv_file.flush()
-                    try:
-                        os.fsync(csv_file.fileno())
-                    except Exception:
-                        pass
+                    try: os.fsync(csv_file.fileno())
+                    except Exception: pass
                 
-                # --no-mergeモードではトラッキング処理をスキップ
+                # トラッキングは完全にスキップ
                 continue
             else:
-                # 通常モード：トラッキング処理
-                boxes = [tr.box for tr in tracker.tracks.values()]
-                confidences = [1.0 for _ in boxes]
-                det_attrs = [
-                    (
-                        tr.age if tr.age is not None else 0,
-                        tr.gender if tr.gender is not None else "",
-                        tr.embedding,
-                    )
-                    for tr in tracker.tracks.values()
-                ]
-                det_quality_weights = [1.0 for _ in boxes]
+                # 通常モード：直前に作った検出結果をそのまま使用する
+                # （do_detect=Falseのフレームでは前フレームの検出を使わない＝空/スキップでOK）
+                pass
 
             if tracker_backend == "embed":
                 det_embs = [e for (_, _, e) in det_attrs]
@@ -1637,6 +1669,26 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    
+    # A100 最適化：一括でどこか最初に呼んでおく
+    import os, torch
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    # CPU側スレッド過多を抑制（デコードや前処理で効果）
+    try:
+        import multiprocessing as _mp
+        os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (_mp.cpu_count() or 8)//2)))
+        os.environ.setdefault("MKL_NUM_THREADS", os.environ["OMP_NUM_THREADS"])
+        torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+    
     # A100向けのランタイム最適化
     configure_cuda_runtime()
     try:
