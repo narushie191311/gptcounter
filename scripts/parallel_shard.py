@@ -197,6 +197,7 @@ def main() -> None:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
+        print(f"[WARMUP] measuring throughput for {sample_sec:.1f}s on device={warmup_device} ...")
         t0 = time.time()
         run_rc = run_proc_streaming(cmd, cwd=project_root, per_chunk_timeout_sec=max(30.0, sample_sec * 10))
         if run_rc != 0:
@@ -556,6 +557,8 @@ def main() -> None:
         # safety envs to avoid TRT/CUDA provider conflicts and reduce spam
         env.setdefault("PYTHONUNBUFFERED", "1")
         env.setdefault("PYTHONNOUSERSITE", "1")  # avoid mixing user-site pkgs (ABI mismatch)
+        # MPSで未実装opが出た場合にCPUフォールバックを許可
+        env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         env.setdefault("ORT_DISABLE_TENSORRT", "1")
         env.setdefault("DISABLE_TRT_EXPORT", "1")
         env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
