@@ -455,8 +455,12 @@ def main() -> None:
     print(f"[PARALLEL] workers={max_workers}, chunks={len(chunks)} (chunk_sec={int(chunk_sec)}/{int(tail_chunk_sec)})")
     # 既存ファイルスキャンのログ
     print(f"[PARALLEL] work_dir={work_dir} base={base_name} video_id={video_id}")
-    # 初期のグローバル概要（長さ既知の場合）
+    # 動画情報と初期のグローバル概要
     if total_sec and total_sec > 0:
+        print(f"[VIDEO] duration: {total_sec:.1f}s ({total_sec/60:.1f}m)")
+        print(f"[GLOBAL] chunks={len(chunks)} progress=0.00% elapsed=0.0m ETA=unknown")
+    else:
+        print(f"[VIDEO] duration: unknown (PyAV fallback failed)")
         print(f"[GLOBAL] chunks={len(chunks)} progress=0.00% elapsed=0.0m ETA=unknown")
 
     # 既存出力スキップ（互換: 旧shard名/新chunk名いずれも読み取り、カバー区間を算出）
@@ -684,6 +688,17 @@ def main() -> None:
                     return None
         return None
 
+    def _format_eta(sec: float) -> str:
+        """Format ETA in hours and minutes, or just minutes if < 1 hour."""
+        if sec <= 0:
+            return "0m"
+        hours = int(sec // 3600)
+        minutes = int((sec % 3600) // 60)
+        if hours > 0:
+            return f"{hours}h{minutes}m"
+        else:
+            return f"{minutes}m"
+
     def hhmmss_ms(sec: float) -> str:
         # format HH:MM:SS.mmm
         td = timedelta(seconds=max(0.0, float(sec)))
@@ -801,11 +816,11 @@ def main() -> None:
                                 parts.append(f"s={int(s)} {p*100:.1f}% ETA={eta_c/60:.1f}m" if eta_c is not None else f"s={int(s)} {p*100:.1f}%")
                         # グローバル先頭行（チャンクは静か/短縮）
                         if bool(int(args.quiet)):
-                            print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% elapsed={elapsed/60:.1f}m ETA={max(0.0, remain_sec)/60:.1f}m")
+                            print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% ({done:.1f}s/{total_sec:.1f}s) elapsed={elapsed/60:.1f}m ETA={_format_eta(max(0.0, remain_sec))}")
                         else:
                             max_items = max(0, int(args.max_chunk_eta))
                             head = parts[:max_items]
-                            print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% elapsed={elapsed/60:.1f}m ETA={max(0.0, remain_sec)/60:.1f}m | { ' | '.join(head)}{' ...' if len(parts)>max_items else ''}")
+                            print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% ({done:.1f}s/{total_sec:.1f}s) elapsed={elapsed/60:.1f}m ETA={_format_eta(max(0.0, remain_sec))} | { ' | '.join(head)}{' ...' if len(parts)>max_items else ''}")
                         # persist progress jsonl
                         try:
                             prog = {
@@ -968,7 +983,7 @@ def main() -> None:
                         est_speed = total_done / max(1e-6, elapsed)
                     remain_video = max(0.0, float(total_sec) - total_done)
                     remain_sec = remain_video / max(1e-6, est_speed)
-                    print(f"[GLOBAL] processed={total_done:.1f}s ({done_frac:.2f}%) | elapsed={elapsed/60:.1f}m ETA={remain_sec/60:.1f}m")
+                    print(f"[GLOBAL] processed={total_done:.1f}s ({done_frac:.2f}%) | elapsed={elapsed/60:.1f}m ETA={_format_eta(remain_sec)}")
     except KeyboardInterrupt:
         print("\n[PARALLEL] KeyboardInterrupt received. Waiting for running tasks to terminate...")
         # The streaming function will exit when processes are killed by the environment/user.
