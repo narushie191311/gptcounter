@@ -462,6 +462,13 @@ def main() -> None:
     else:
         print(f"[VIDEO] duration: unknown (PyAV fallback failed)")
         print(f"[GLOBAL] chunks={len(chunks)} progress=0.00% elapsed=0.0m ETA=unknown")
+    
+    # RAWファイル生成の設定確認
+    if args.raw_output.strip():
+        print(f"[RAW] will generate per-chunk raw files and merge to: {args.raw_output}")
+        if int(args.online_merge) == 0:
+            print(f"[RAW] WARNING: --no-merge may cause empty raw files. Consider using --online-merge 1")
+            print(f"[RAW] INFO: Will auto-enable minimal merging (--merge-every-sec 300) for raw file generation")
 
     # 既存出力スキップ（互換: 旧shard名/新chunk名いずれも読み取り、カバー区間を算出）
     def hhmmss_to_sec(s: str) -> Optional[float]:
@@ -618,12 +625,21 @@ def main() -> None:
         ]
         if auto_device:
             cmd += ["--device", auto_device]
+        # オンラインマージの制御（RAWファイル生成のためにも必要）
         if int(args.online_merge) == 0:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
-        # add per-chunk raw path unless user already forced one in extra-args
+        else:
+            # オンラインマージ有効時は適度な間隔でマージ
+            cmd += ["--merge-every-sec", "30"]
+        
+        # RAWファイル生成の強制（--no-mergeでもRAWは生成する）
         if raw_csv is not None and raw_csv.strip():
             if "--output-csv-raw" not in args.extra_args:
                 cmd += ["--output-csv-raw", raw_csv]
+                # RAWファイル生成のため、最低限のマージ処理を有効化
+                if int(args.online_merge) == 0:
+                    cmd += ["--merge-every-sec", "300"]  # 5分毎にマージ
+
         # Inject auto-quality defaults if not overridden
         extra = args.extra_args.strip()
         def _has_flag(flag: str) -> bool:
@@ -1125,6 +1141,26 @@ def main() -> None:
         raw_dir = os.path.dirname(raw_final)
         if raw_dir:
             os.makedirs(raw_dir, exist_ok=True)
+        
+        # RAWファイルの状況をチェック
+        empty_files = []
+        total_size = 0
+        for (s, d, rp) in sorted(raw_chunks, key=lambda x: x[0]):
+            if os.path.exists(rp):
+                size = os.path.getsize(rp)
+                total_size += size
+                if size < 1000:  # 1KB未満は空とみなす
+                    empty_files.append((s, d, rp, size))
+        
+        if empty_files:
+            print(f"[RAW-WARN] {len(empty_files)} raw files are suspiciously small:")
+            for s, d, rp, size in empty_files[:5]:  # 最初の5個のみ表示
+                print(f"[RAW-WARN]   {os.path.basename(rp)}: {size} bytes (start={s}s, dur={d}s)")
+            if len(empty_files) > 5:
+                print(f"[RAW-WARN]   ... and {len(empty_files) - 5} more")
+            print(f"[RAW-WARN] Total raw files size: {total_size} bytes")
+            print(f"[RAW-WARN] This may indicate --no-merge is preventing proper raw file generation")
+        
         with open(raw_final, "w", newline="") as fo:
             wrote_header_raw = False
             for (s, d, rp) in sorted(raw_chunks, key=lambda x: x[0]):
