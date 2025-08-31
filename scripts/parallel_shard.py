@@ -608,6 +608,7 @@ def main() -> None:
     def make_cmd(start_s: float, dur_s: float, out_csv: str, gpu_env: Optional[str], raw_csv: Optional[str]) -> Tuple[List[str], Optional[dict]]:
         # Auto device selection when user didn't specify in extra-args
         extra = args.extra_args.strip()
+        print(f"[CMD-INPUT] chunk {start_s}s: extra-args = '{extra}'")
         auto_device = None
         try:
             if ("--device" not in extra):
@@ -707,12 +708,16 @@ def main() -> None:
             if filtered_out:
                 print(f"[CMD-FILTER] filtered out merge flags: {' '.join(filtered_out)}")
             if filtered_extra:
+                print(f"[CMD-FILTER] remaining extra args: {' '.join(filtered_extra)}")
                 cmd += filtered_extra
         
         # デバッグ用：最終的なコマンドを表示（マージ関連のフラグが正しく処理されているか確認）
         if raw_csv is not None and raw_csv.strip():
             merge_flags = [flag for flag in cmd if flag in ["--no-merge", "--merge-every-sec"]]
             print(f"[CMD-DEBUG] chunk {start_s}s: merge flags = {merge_flags}")
+            # --no-mergeフラグが含まれていないかを確認
+            if "--no-merge" in cmd:
+                print(f"[CMD-ERROR] chunk {start_s}s: --no-merge flag is still present in command!")
             # 完全なコマンド文字列も表示（デバッグ用）
             cmd_str = " ".join(cmd)
             print(f"[CMD-FULL] chunk {start_s}s: {cmd_str}")
