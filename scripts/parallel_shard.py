@@ -453,6 +453,7 @@ def main() -> None:
         idx += 1
 
     print(f"[PARALLEL] workers={max_workers}, chunks={len(chunks)} (chunk_sec={int(chunk_sec)}/{int(tail_chunk_sec)})")
+    print(f"[PARALLEL] raw_chunks={len(raw_chunks)} (raw_output='{args.raw_output}')")
     # 既存ファイルスキャンのログ
     print(f"[PARALLEL] work_dir={work_dir} base={base_name} video_id={video_id}")
     if len(gpu_ids) == 1:
@@ -961,6 +962,9 @@ def main() -> None:
                 if args.raw_output.strip():
                     # align by index since we appended in parallel above
                     raw_op = raw_chunks[i][2] if i < len(raw_chunks) else None
+                    print(f"[RAW-DEBUG] chunk {s}s: raw_output='{args.raw_output}', raw_chunks[{i}]={raw_chunks[i] if i < len(raw_chunks) else 'OUT_OF_RANGE'}, raw_op='{raw_op}'")
+                else:
+                    print(f"[RAW-DEBUG] chunk {s}s: raw_output is empty, raw_op=None")
                 cmd, env = make_cmd(s, d, op, gpu_env, raw_op)
                 dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
                 print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
