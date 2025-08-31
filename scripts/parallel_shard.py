@@ -536,6 +536,17 @@ def main() -> None:
             filtered.append((s, d, op))
         chunks = filtered
 
+    # 親プロセスのレジューム状態ファイル（子ログからの進捗も記録）
+    resume_state_path = os.path.join(work_dir, "chunk_resume_state.json")
+    chunk_state: dict = {}
+    try:
+        if os.path.exists(resume_state_path):
+            with open(resume_state_path, "r") as rf:
+                chunk_state = json.load(rf)
+            print(f"[RESUME-STATE] loaded {len(chunk_state)} entries from {resume_state_path}")
+    except Exception:
+        chunk_state = {}
+
     # Partial resume within chunks: if a chunk file exists and has last ts, start from there
     adjusted: List[Tuple[float, float, str]] = []
     for s, d, op in chunks:
@@ -560,6 +571,18 @@ def main() -> None:
                     # ファイルはあるが内容から再開点が読めない場合
                     if rng and first_s is not None and last_s is not None:
                         print(f"[RESUME-CHUNK] {int(s)}s kept (file exists but no forward progress; span {last_s-first_s:.1f}s)")
+            # chunk_resume_state.json に基づく再開点（CSVが欠落/未書込でも利用）
+            st = None
+            try:
+                st = float(chunk_state.get(str(int(s)), 0.0) or 0.0)
+            except Exception:
+                st = None
+            if st is not None and st > s + 1.0:
+                cand_new_s = st
+                cand_new_d = (max(0.0, float(total_sec) - cand_new_s) if (d == 0.0 and total_sec > 0) else max(0.0, (s + d) - cand_new_s))
+                if cand_new_s > new_s + 1e-3:
+                    new_s, new_d = cand_new_s, cand_new_d
+                    print(f"[RESUME-STATE] applying resume: {int(s)}s -> {int(new_s)}s rem={new_d:.1f}s")
         except Exception:
             pass
         adjusted.append((new_s, new_d, op))
@@ -705,6 +728,23 @@ def main() -> None:
                     perc = float(m.group(1)) / 100.0
                     with lock:
                         progress_map[start_key] = max(0.0, min(1.0, perc))
+                # 行頭の [HH:MM:SS(.mmm)] を拾って動画内時刻をレジューム状態に記録
+                tm = re.search(r"^\[([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,3}))?\]", line.strip())
+                if tm:
+                    try:
+                        h = int(tm.group(1)); mi = int(tm.group(2)); s = int(tm.group(3)); ms = int((tm.group(4) or "0").ljust(3, '0')[:3])
+                        sec = float(h*3600 + mi*60 + s) + (ms/1000.0)
+                        with lock:
+                            prev = float(chunk_state.get(str(int(start_key)), 0.0) or 0.0)
+                            if sec > prev:
+                                chunk_state[str(int(start_key))] = sec
+                                try:
+                                    with open(resume_state_path, "w") as wf:
+                                        json.dump(chunk_state, wf)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
             elif "[CHUNK_COMPLETED]" in line and "global_end_sec" in line:
                 # 完了時は100%に
                 with lock:
