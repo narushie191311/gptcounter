@@ -539,7 +539,23 @@ def main() -> None:
         # Inject auto-quality defaults if not overridden
         extra = args.extra_args.strip()
         def _has_flag(flag: str) -> bool:
-            return (f" {flag} " in f" {extra} ") or extra.startswith(flag) or extra.endswith(flag) or (flag in extra)
+            """Return True if the flag (e.g., "--det-size") is present in extra-args tokens.
+            This performs exact token checks and also matches "--flag=value" forms.
+            """
+            if not extra:
+                return False
+            try:
+                import shlex
+                tokens = shlex.split(extra)
+            except Exception:
+                tokens = extra.split()
+            # exact flag token or --flag=value
+            for tok in tokens:
+                if tok == flag:
+                    return True
+                if tok.startswith(flag + "="):
+                    return True
+            return False
         if 'auto_yolo' in locals() and not _has_flag("--yolo-weights"):
             cmd += ["--yolo-weights", auto_yolo]
         if 'auto_det' in locals() and not _has_flag("--det-size"):
