@@ -57,6 +57,12 @@ def run_proc_streaming(
         "YOLOv8",
         "Downloading",
         "Creating new Ultralytics Settings",
+        "Unable to register cuDNN factory",
+        "Unable to register cuBLAS factory",
+        "absl::InitializeLog()",
+        "E0000 00:00:",
+        "W0000 00:00:",
+        "[AUTOTUNE]",
     )
 
     def _should_print(line: str) -> bool:
@@ -146,6 +152,8 @@ def main() -> None:
     ap.add_argument("--verify-coverage", type=int, default=1, help="verify merged coverage against video length and print summary (1=on)")
     ap.add_argument("--allow-partial", type=int, default=0, help="do not fail on some shard errors; merge whatever succeeded (1=on)")
     ap.add_argument("--workers", type=int, default=0, help="cap total concurrent workers (0=auto)")
+    ap.add_argument("--quiet", type=int, default=0, help="suppress noisy child init logs and compact progress (1=on)")
+    ap.add_argument("--max-chunk-eta", type=int, default=8, help="max number of per-chunk ETA items to render in progress line")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -199,7 +207,7 @@ def main() -> None:
             cmd += args.extra_args.strip().split()
         print(f"[WARMUP] measuring throughput for {sample_sec:.1f}s on device={warmup_device} ...")
         t0 = time.time()
-        run_rc = run_proc_streaming(cmd, cwd=project_root, per_chunk_timeout_sec=max(30.0, sample_sec * 10))
+        run_rc = run_proc_streaming(cmd, cwd=project_root, per_chunk_timeout_sec=max(30.0, sample_sec * 10), suppress_init=bool(int(args.quiet)))
         if run_rc != 0:
             print(f"[WARMUP] non-zero return code={run_rc}")
         t1 = time.time()
@@ -253,7 +261,7 @@ def main() -> None:
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
         print("[PREWARM] starting a short run to pre-download models and warm caches...")
-        _ = run_proc_streaming(cmd, cwd=project_root, per_chunk_timeout_sec=max(60.0, float(args.prewarm_sec) * 20))
+        _ = run_proc_streaming(cmd, cwd=project_root, per_chunk_timeout_sec=max(60.0, float(args.prewarm_sec) * 20), suppress_init=bool(int(args.quiet)))
         try:
             if os.path.exists(tmp_out):
                 os.remove(tmp_out)
@@ -499,6 +507,10 @@ def main() -> None:
                     else:
                         new_d = max(0.0, (s + d) - new_s)
                     print(f"[RESUME-CHUNK] {int(s)}s -> {int(new_s)}s rem={new_d:.1f}s")
+                else:
+                    # ファイルはあるが内容から再開点が読めない場合
+                    if rng and first_s is not None and last_s is not None:
+                        print(f"[RESUME-CHUNK] {int(s)}s kept (file exists but no forward progress; span {last_s-first_s:.1f}s)")
         except Exception:
             pass
         adjusted.append((new_s, new_d, op))
@@ -696,8 +708,15 @@ def main() -> None:
                                 speed_c = (w * p) / max(1e-6, elapsed_c)
                                 remain_c = (w * (1.0 - p)) / max(1e-6, speed_c)
                                 eta_c = remain_c
-                            parts.append(f"s={int(s)} {p*100:.1f}% ETA={eta_c/60:.1f}m" if eta_c is not None else f"s={int(s)} {p*100:.1f}%")
-                        print(f"[PROGRESS] processed_est={done:.1f}s ({frac:.2f}%) | chunks={len(chunks)} elapsed={elapsed/60:.1f}m ETA={max(0.0, remain_sec)/60:.1f}m | { ' | '.join(parts[:8])}{' ...' if len(parts)>8 else ''}")
+                            if not bool(int(args.quiet)):
+                                parts.append(f"s={int(s)} {p*100:.1f}% ETA={eta_c/60:.1f}m" if eta_c is not None else f"s={int(s)} {p*100:.1f}%")
+                        # グローバル先頭行（チャンクは静か/短縮）
+                        if bool(int(args.quiet)):
+                            print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% elapsed={elapsed/60:.1f}m ETA={max(0.0, remain_sec)/60:.1f}m")
+                        else:
+                            max_items = max(0, int(args.max_chunk_eta))
+                            head = parts[:max_items]
+                            print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% elapsed={elapsed/60:.1f}m ETA={max(0.0, remain_sec)/60:.1f}m | { ' | '.join(head)}{' ...' if len(parts)>max_items else ''}")
                         # persist progress jsonl
                         try:
                             prog = {
@@ -780,7 +799,7 @@ def main() -> None:
                         timeout_sec = max(600.0, exp_wall * 3.0)  # 3倍の余裕
                     with lock:
                         start_wall_map[start_sec] = time.time()
-                    rc = run_proc_streaming(c, e, project_root, timeout_sec, pref, _cb, suppress_init=True)
+                    rc = run_proc_streaming(c, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)) or True)
                     tries = 0
                     while rc != 0 and tries < int(args.retries):
                         tries += 1
@@ -806,7 +825,7 @@ def main() -> None:
                         # 次回タイムアウトも動的
                         with lock:
                             start_wall_map[start_sec] = time.time()
-                        rc = run_proc_streaming(c2, e, project_root, timeout_sec, pref, _cb, suppress_init=True)
+                        rc = run_proc_streaming(c2, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)) or True)
                     return (rc, start_sec, dur, out_path)
                 futs.append(ex.submit(worker))
             for fut in as_completed(futs):
@@ -860,7 +879,7 @@ def main() -> None:
                         est_speed = total_done / max(1e-6, elapsed)
                     remain_video = max(0.0, float(total_sec) - total_done)
                     remain_sec = remain_video / max(1e-6, est_speed)
-                    print(f"[PROGRESS] processed={total_done:.1f}s ({done_frac:.2f}%) | elapsed={elapsed/60:.1f}m ETA={remain_sec/60:.1f}m")
+                    print(f"[GLOBAL] processed={total_done:.1f}s ({done_frac:.2f}%) | elapsed={elapsed/60:.1f}m ETA={remain_sec/60:.1f}m")
     except KeyboardInterrupt:
         print("\n[PARALLEL] KeyboardInterrupt received. Waiting for running tasks to terminate...")
         # The streaming function will exit when processes are killed by the environment/user.
