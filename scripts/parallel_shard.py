@@ -157,12 +157,51 @@ def main() -> None:
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
-    if not cap.isOpened():
-        raise SystemExit(f"cannot open video: {args.video}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    total_sec = (total_frames / fps) if total_frames > 0 else 0.0
-    cap.release()
+    fps = 30.0
+    total_frames = 0
+    total_sec = 0.0
+    if cap is not None and cap.isOpened():
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            total_sec = (total_frames / fps) if total_frames > 0 else 0.0
+        except Exception:
+            pass
+        try:
+            cap.release()
+        except Exception:
+            pass
+    else:
+        # PyAV fallback (OpenCV failed). Don't abort; try to estimate from container.
+        try:
+            import av  # type: ignore
+            _cont = av.open(args.video, mode='r')
+            _v = _cont.streams.video[0]
+            try:
+                if getattr(_v, "average_rate", None):
+                    fps = float(_v.average_rate)
+            except Exception:
+                fps = fps
+            dur = None
+            try:
+                if getattr(_cont, "duration", None):
+                    dur = float(_cont.duration) / 1_000_000.0
+            except Exception:
+                dur = None
+            if (not dur) and getattr(_v, "duration", None) and getattr(_v, "time_base", None):
+                try:
+                    dur = float(_v.duration * _v.time_base)
+                except Exception:
+                    dur = None
+            if dur and dur > 0:
+                total_sec = float(dur)
+                total_frames = int(total_sec * fps)
+            _cont.close()
+            print(f"[INFO] OpenCV failed to open video; using PyAV metadata fallback. total_sec~{total_sec:.1f}s fps~{fps:.2f}")
+        except Exception:
+            # As a last resort, continue with unknown length; analyzer will handle decoding
+            exists = os.path.exists(args.video)
+            print(f"[WARN] cannot open video via OpenCV/PyAV (exists={exists}). Proceeding with unknown length; scheduling minimal chunks.")
 
     # paths prepared before auto-shard warmup uses them
     video_id = sanitize(os.path.splitext(os.path.basename(args.video))[0])
@@ -409,6 +448,9 @@ def main() -> None:
     print(f"[PARALLEL] workers={max_workers}, chunks={len(chunks)} (chunk_sec={int(chunk_sec)}/{int(tail_chunk_sec)})")
     # 既存ファイルスキャンのログ
     print(f"[PARALLEL] work_dir={work_dir} base={base_name} video_id={video_id}")
+    # 初期のグローバル概要（長さ既知の場合）
+    if total_sec and total_sec > 0:
+        print(f"[GLOBAL] chunks={len(chunks)} progress=0.00% elapsed=0.0m ETA=unknown")
 
     # 既存出力スキップ（互換: 旧shard名/新chunk名いずれも読み取り、カバー区間を算出）
     def hhmmss_to_sec(s: str) -> Optional[float]:
