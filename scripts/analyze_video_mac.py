@@ -80,10 +80,8 @@ def init_face_app(det_w: int = 640, det_h: int = 640, device: str = "auto", face
     # Colab(A100)ではCUDA、MacではCPU/MPSを使い分け
     requested_cuda = device.lower() in ("cuda", "gpu")
     cuda_available = torch.cuda.is_available()
-    # 強制CPU環境変数でGPUを避ける（TRT/ドライバ競合回避）
-    force_cpu = bool(os.environ.get("ORT_FORCE_CPU_FOR_FACE", "0") == "1")
     providers_try = []
-    if not force_cpu and (requested_cuda or (device.lower() == "auto" and cuda_available)):
+    if requested_cuda or (device.lower() == "auto" and cuda_available):
         providers_try.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
     providers_try.append(["CPUExecutionProvider"])  # フォールバック
 
@@ -96,7 +94,7 @@ def init_face_app(det_w: int = 640, det_h: int = 640, device: str = "auto", face
             return app
         except Exception as e:  # noqa: BLE001
             last_err = e
-    raise RuntimeError(f"FaceAnalysis初期化に失敗: {repr(last_err)} | providers_tried={providers_try}")
+    raise RuntimeError(f"FaceAnalysis初期化に失敗: {last_err}")
 
 
 def init_person_detector(device: str = "auto", trt_engine: Optional[str] = None, yolo_weights: str = "yolov8n.pt") -> YOLO:
@@ -225,9 +223,6 @@ def detect_person_boxes(
     if use_half:
         predict_kwargs["half"] = True
     try:
-        # 高解像度時はややリコール寄り（conf を少し下げる）
-        if imgsz and imgsz >= 1280:
-            predict_kwargs["conf"] = max(0.2, min(float(predict_kwargs.get("conf", 0.5)), 0.5))
         results = yolo.predict(**predict_kwargs)
     except TypeError:
         # half引数が未対応な古いバージョンへのフォールバック
@@ -327,9 +322,7 @@ def load_networks(paths: Dict[str, str]):
     return face_net, age_net, gender_net
 
 
-def detect_faces_and_attrs(face_app: Optional[FaceAnalysis], frame: np.ndarray, conf_threshold: float = 0.5):
-    if face_app is None:
-        return []
+def detect_faces_and_attrs(face_app: FaceAnalysis, frame: np.ndarray, conf_threshold: float = 0.5):
     faces = face_app.get(frame)
     results = []  # (box, score, age, gender_str, embedding)
     for f in faces:
@@ -382,11 +375,6 @@ class Track:
     person_id: Optional[int] = None
     embedding: Optional[np.ndarray] = None
     embedding_count: int = 0
-    # Robust aggregation accumulators
-    age_wsum: float = 0.0
-    age_w: float = 0.0
-    gender_psum: float = 0.0  # probability of Female
-    gender_w: float = 0.0
 
 
 class PersonRegistry:
@@ -395,8 +383,6 @@ class PersonRegistry:
         self.next_person_id = 1
         self.person_id_to_embedding: Dict[int, np.ndarray] = {}
         self.person_id_to_count: Dict[int, int] = {}
-        # temporal memory of best-quality snapshots per person
-        self.person_id_to_best: Dict[int, Tuple[np.ndarray, float]] = {}
 
     @staticmethod
     def _cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -573,65 +559,6 @@ def _compute_face_quality_metrics(frame: np.ndarray, box: Tuple[int, int, int, i
         return 0.0, 0.0
 
 
-def _extract_clothing_features(frame: np.ndarray, person_box: Optional[Tuple[int, int, int, int]]) -> Optional[Dict[str, float]]:
-    if person_box is None:
-        return None
-    try:
-        x, y, w, h = [int(v) for v in person_box]
-        H, W = frame.shape[:2]
-        x = max(0, min(x, W - 1)); y = max(0, min(y, H - 1))
-        w = max(1, min(w, W - x)); h = max(1, min(h, H - y))
-        crop = frame[y:y + h, x:x + w]
-        if crop.size == 0 or h < 40 or w < 20:
-            return None
-        upper = crop[: max(1, int(h * 0.5)), :]
-        lower = crop[max(1, int(h * 0.5)) :, :]
-        upper_hsv = cv2.cvtColor(upper, cv2.COLOR_BGR2HSV)
-        lower_hsv = cv2.cvtColor(lower, cv2.COLOR_BGR2HSV)
-        # Hue histogram (18 bins)
-        uh = cv2.calcHist([upper_hsv], [0], None, [18], [0, 180]).flatten().astype(np.float32)
-        uh = uh / max(uh.sum(), 1e-6)
-        # Saturation mean
-        us = float(np.mean(upper_hsv[:, :, 1])) / 255.0
-        # Edge density (upper)
-        ug = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY)
-        ed = float(np.mean(cv2.Canny(ug, 50, 150) > 0))
-        # Silhouette ratio (expanding to bottom)
-        width_top = float(np.mean(lower[: max(1, int(h * 0.1)), :]))
-        width_bottom = float(np.mean(lower[max(1, int(-h * 0.1)) :, :]))
-        sil = (width_bottom + 1.0) / (width_top + 1.0)
-        # Brightness contrast (std)
-        brightness_std = float(np.std(ug)) / 128.0
-        return {"upper_h_bins": 18.0, "uh0": uh[0] if uh.size >= 1 else 0.0, "uh1": uh[1] if uh.size >= 2 else 0.0,
-                "uh16": uh[16] if uh.size >= 17 else 0.0, "uh17": uh[17] if uh.size >= 18 else 0.0,
-                "uh9_13": float(np.sum(uh[9:13]) if uh.size >= 14 else 0.0),
-                "sat": us, "edge": ed, "sil": sil, "bstd": brightness_std}
-    except Exception:
-        return None
-
-
-def _predict_gender_from_clothing(feat: Dict[str, float]) -> Tuple[str, float]:
-    # Rule-based, tuned for JP events: pink/sat/silhouette -> female, blue -> male
-    pink = float(feat.get("uh0", 0.0) + feat.get("uh1", 0.0) + feat.get("uh16", 0.0) + feat.get("uh17", 0.0))
-    blue = float(feat.get("uh9_13", 0.0))
-    sat = float(feat.get("sat", 0.0))
-    sil = float(feat.get("sil", 1.0))
-    edge = float(feat.get("edge", 0.0))
-    bstd = float(feat.get("bstd", 0.0))
-    score = 0.5
-    score += 0.35 * pink
-    score -= 0.20 * blue
-    score += 0.20 * sat
-    if sil > 1.15:
-        score += 0.20
-    if edge > 0.10:
-        score += 0.05
-    score += 0.05 * bstd
-    conf = float(min(1.0, abs(score - 0.5) * 2.0))
-    gender = "Female" if score >= 0.5 else "Male"
-    return gender, conf
-
-
 class StatsAccumulator:
     def __init__(self) -> None:
         self.gender_to_count: Dict[str, int] = {"Male": 0, "Female": 0, "": 0}
@@ -676,10 +603,9 @@ def compute_geom_features(frame: np.ndarray, box: Tuple[int, int, int, int]) -> 
 def analyze_video(
     video_path: str,
     output_csv: str,
-    output_csv_raw: Optional[str],
     start_sec: float,
     duration_sec: float,
-    global_start_sec: Optional[float] = None,
+    output_csv_raw: Optional[str] = None,
     show_window: bool = True,
     detect_every_n: int = 5,
     conf_threshold: float = 0.6,
@@ -713,8 +639,7 @@ def analyze_video(
 
     # Face/YOLO 初期化
     face_app = init_face_app(det_w=current_det_w, det_h=current_det_h, device=device, face_model=face_model)
-    disable_trt_export_env = bool(os.environ.get("DISABLE_TRT_EXPORT", "0") == "1")
-    if (not disable_trt_export_env) and trt_engine is None and yolo_weights and (device.lower() in ("cuda", "auto")) and torch.cuda.is_available():
+    if trt_engine is None and yolo_weights and (device.lower() in ("cuda", "auto")) and torch.cuda.is_available():
         built_engine = ensure_trt_engine(yolo_weights)
         if built_engine:
             trt_engine = built_engine
@@ -859,14 +784,18 @@ def analyze_video(
 
     # マージ処理の設定
     if no_merge:
-        # --no-mergeフラグが指定された場合でも、適切なマージ処理を有効化（データ出力のため）
-        print(f"[INFO] --no-merge flag detected, but enabling minimal merging for data output", flush=True)
-        tracker = EmbeddingTracker(iou_gate=0.3, sim_gate=0.4, max_missed=int(fps * 2), reid=PersonRegistry(cosine_thresh=0.6))
-        print(f"[INFO] マージ処理: IoU=0.3, Sim=0.4, ReID=0.6 (minimal mode)", flush=True)
+        # --no-mergeフラグが指定された場合：特徴量のみ保持、類似度判定なし
+        print(f"[INFO] --no-merge flag detected: raw feature extraction mode (no similarity matching)", flush=True)
+        # 類似度判定を無効化し、特徴量のみを保持するモード
+        tracker = EmbeddingTracker(iou_gate=0.0, sim_gate=0.0, max_missed=int(fps * 10), reid=PersonRegistry(cosine_thresh=0.0))
+        print(f"[INFO] 特徴量抽出モード: IoU=0.0, Sim=0.0, ReID=0.0 (raw features only)", flush=True)
     else:
-        # 通常のマージ処理
-        tracker = EmbeddingTracker(iou_gate=gate_iou, sim_gate=gate_sim, max_missed=int(fps * 2), reid=PersonRegistry(cosine_thresh=reid_cosine_thresh))
-        print(f"[INFO] マージ処理: IoU={gate_iou}, Sim={gate_sim}, ReID={reid_cosine_thresh}", flush=True)
+        # 通常のマージ処理（より寛容な閾値でデータ生成を確実にする）
+        safe_iou = max(0.1, min(0.5, gate_iou))  # 0.1-0.5の範囲に制限
+        safe_sim = max(0.2, min(0.6, gate_sim))  # 0.2-0.6の範囲に制限
+        safe_reid = max(0.3, min(0.7, reid_cosine_thresh))  # 0.3-0.7の範囲に制限
+        tracker = EmbeddingTracker(iou_gate=safe_iou, sim_gate=safe_sim, max_missed=int(fps * 5), reid=PersonRegistry(cosine_thresh=safe_reid))
+        print(f"[INFO] マージ処理: IoU={safe_iou:.1f}, Sim={safe_sim:.1f}, ReID={safe_reid:.1f} (safe mode)", flush=True)
     # attribute memory for external trackers
     ext_attr: Dict[int, Dict[str, object]] = {}
 
@@ -941,26 +870,6 @@ def analyze_video(
 
     csv_file = open(effective_csv_path, ("a" if resume_mode else "w"), newline="")
     writer = csv.writer(csv_file)
-    # raw（非マージ）出力の準備（任意）
-    raw_writer: Optional[csv.writer] = None
-    raw_file = None
-    if output_csv_raw:
-        raw_dir = os.path.dirname(output_csv_raw) or "."
-        os.makedirs(raw_dir, exist_ok=True)
-        raw_file = open(output_csv_raw, "w", newline="")
-        raw_writer = csv.writer(raw_file)
-        raw_writer.writerow([
-            "timestamp",
-            "ts_from_file_start",
-            "frame",
-            "face_x","face_y","face_w","face_h",
-            "person_x","person_y","person_w","person_h",
-            "face_conf",
-            "age_face","gender_face",
-            "gender_clothing","gender_clothing_conf",
-            "face_size","sharpness",
-            "embedding_b64",
-        ])
     # 実行開始時刻（JST）を列に保持（各行に同値を書き込む）
     run_started_utc = datetime.now(timezone.utc)
     run_started_jst_dt = run_started_utc.astimezone(ZoneInfo("Asia/Tokyo")) if ZoneInfo else run_started_utc
@@ -1008,9 +917,7 @@ def analyze_video(
     start_wall = time.time()
     next_log_wall = start_wall + float(log_every_sec)
     next_ckpt_wall = start_wall + float(checkpoint_every_sec)
-    # --no-mergeフラグが指定された場合でも、データ出力のため最小限のマージを有効化
-    effective_merge_sec = max(60.0, float(merge_every_sec)) if merge_every_sec and merge_every_sec > 0 else 60.0
-    next_merge_wall = start_wall + effective_merge_sec
+    next_merge_wall = start_wall + max(60.0, float(merge_every_sec)) if merge_every_sec and merge_every_sec > 0 else start_wall + 60.0
     # 自動調整: 目標ウォール時間（分）
     target_wall_min = float(os.environ.get("TARGET_WALL_MIN", str(getattr(locals().get('args', object()), 'target_wall_min', 0))) or 0)
     # 起動後のウォームアップ区間（秒）
@@ -1179,7 +1086,6 @@ def analyze_video(
         except Exception:
             pass
 
-    written_rows = 0
     try:
         # フレームイテレータ（PyAV/OpenCV）
         if dec_kind == "pyav":
@@ -1234,12 +1140,6 @@ def analyze_video(
                             best_i, best_pb, best_pb_idx = i, pb, idx
                     if best_pb_idx is not None:
                         used_person_indices.add(best_pb_idx)
-                    # 服装特徴/性別補助
-                    clothing_feat = _extract_clothing_features(frame, best_pb)
-                    clothing_gender, clothing_conf = ("", 0.0)
-                    if clothing_feat is not None:
-                        cg, cc = _predict_gender_from_clothing(clothing_feat)
-                        clothing_gender, clothing_conf = cg, cc
                     # 体埋め込み: HSVヒスト/OSNet/アンサンブル
                     body_emb_hist = compute_body_embedding(frame, best_pb) if (best_pb is not None and reid_backend in ("hist", "ensemble")) else None
                     body_emb_osn = None
@@ -1272,38 +1172,6 @@ def analyze_video(
                     fs_norm = min(1.0, max(0.0, fsize / max(1.0, 0.2 * W * H)))
                     wq = float(fs_norm * (sharp ** 1.5))
                     det_quality_weights.append(max(0.05, wq))
-                    # 非マージ（raw）書き込み
-                    if raw_writer is not None:
-                        # ts文字列
-                        fps_val = float(fps)
-                        current_video_sec = (frame_idx / fps_val)
-                        ts_str = format_timestamp(current_video_sec - start_sec)
-                        ts_from_file_start = format_timestamp(current_video_sec)
-                        # person box
-                        if best_pb is not None:
-                            px, py, pw, ph = best_pb
-                        else:
-                            px = py = pw = ph = 0
-                        # embedding b64（fusedがあれば優先）
-                        emb_src = fused if fused is not None else face_emb
-                        emb_b64 = ""
-                        if emb_src is not None:
-                            try:
-                                emb_b64 = base64.b64encode(np.asarray(emb_src, dtype=np.float32).tobytes()).decode("ascii")
-                            except Exception:
-                                emb_b64 = ""
-                        raw_writer.writerow([
-                            ts_str, ts_from_file_start, frame_idx,
-                            fx, fy, fw, fh,
-                            px, py, pw, ph,
-                            f"{conf:.3f}",
-                            age if age else "",
-                            gender if gender else "",
-                            clothing_gender,
-                            f"{clothing_conf:.2f}",
-                            f"{fsize:.1f}", f"{sharp:.3f}",
-                            emb_b64,
-                        ])
                     # 顔ボックスをトラッキングボックスとして使用
                     boxes.append((fx, fy, fw, fh))
                     confidences.append(conf)
@@ -1321,7 +1189,77 @@ def analyze_video(
                     confidences.append(pconf)
                     det_attrs.append((0, "", fused))
                     det_quality_weights.append(0.1)
+            
+            # --no-mergeモードの場合：トラッキングをスキップして直接CSVに書き込み
+            if no_merge:
+                # 検出された顔を直接CSVに書き込み（トラッキング・マージなし）
+                for i, ((fx, fy, fw, fh), conf, (age, gender, fused)) in enumerate(zip(boxes, confidences, det_attrs)):
+                    # 顔品質メトリクス計算
+                    fsize, sharp = 0.0, 0.0
+                    try:
+                        crop_gray = cv2.cvtColor(frame[fy:fy+fh, fx:fx+fw], cv2.COLOR_BGR2GRAY)
+                        sharp = _compute_laplacian_sharpness(crop_gray)
+                        fsize = float(fw * fh)
+                    except Exception:
+                        pass
+                    
+                    # 埋め込みベクトルをbase64エンコード
+                    emb_b64 = ""
+                    if fused is not None:
+                        try:
+                            emb_b64 = base64.b64encode(np.asarray(fused, dtype=np.float32).tobytes()).decode("ascii")
+                        except Exception:
+                            emb_b64 = ""
+                    
+                    # タイムスタンプ計算
+                    relative_sec = current_time_sec - start_sec
+                    ts_str = format_timestamp(relative_sec)
+                    ts_from_file_start = format_timestamp(current_time_sec)
+                    
+                    # 絶対時刻（JST）
+                    abs_ts = ""
+                    if video_dt is not None:
+                        try:
+                            abs_dt = (video_dt + timedelta(seconds=float(current_time_sec)))
+                            abs_ts = abs_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                        except Exception:
+                            abs_ts = ""
+                    
+                    # CSV行を書き込み
+                    row = [
+                        ts_str,                    # timestamp
+                        ts_from_file_start,        # ts_from_file_start
+                        frame_idx,                 # frame
+                        i,                         # person_id (フレーム内の連番)
+                        i,                         # track_id (フレーム内の連番)
+                        age if age else "",        # age
+                        gender if gender else "",  # gender
+                        fx, fy, fw, fh,           # x, y, w, h
+                        f"{conf:.3f}",            # conf
+                        f"{fsize:.1f}",           # face_size
+                        f"{sharp:.3f}",           # sharpness
+                        emb_b64,                  # embedding_b64
+                        abs_ts,                   # absolute_timestamp
+                        run_started_jst_str,      # run_started_jst
+                    ]
+                    writer.writerow(row)
+                
+                # 統計更新（フレーム単位で軽量更新）
+                for age, gender, _ in det_attrs:
+                    stats.update(age, gender)
+                
+                # フレーム処理後にCSVをフラッシュ（データ損失防止）
+                if frame_idx % flush_every_n == 0:
+                    csv_file.flush()
+                    try:
+                        os.fsync(csv_file.fileno())
+                    except Exception:
+                        pass
+                
+                # --no-mergeモードではトラッキング処理をスキップ
+                continue
             else:
+                # 通常モード：トラッキング処理
                 boxes = [tr.box for tr in tracker.tracks.values()]
                 confidences = [1.0 for _ in boxes]
                 det_attrs = [
@@ -1336,9 +1274,6 @@ def analyze_video(
 
             if tracker_backend == "embed":
                 det_embs = [e for (_, _, e) in det_attrs]
-                # tighten gating to reduce ID switches (more conservative matching)
-                tracker.iou_gate = 0.25
-                tracker.sim_gate = 0.45
                 tracks = tracker.update(boxes, det_embs, frame_idx, det_weights=det_quality_weights)
             else:
                 # 外部トラッカー: person_boxesからのトラッキング
@@ -1382,19 +1317,8 @@ def analyze_video(
                         best_i, best_idx = val, idx
                 if best_idx is not None and best_idx < len(det_attrs):
                     age, gender, emb = det_attrs[best_idx]
-                    # robust, quality-weighted temporal aggregation
-                    w = float(det_quality_weights[best_idx])
-                    if isinstance(age, (int, float)) and age > 0:
-                        tr.age_wsum += float(age) * w
-                        tr.age_w += w
-                        tr.age = int(round(tr.age_wsum / max(tr.age_w, 1e-6)))
-                    # map gender to prob(Female)
-                    if isinstance(gender, str) and gender:
-                        p_f = 1.0 if gender.lower().startswith("f") else 0.0
-                        tr.gender_psum += p_f * w
-                        tr.gender_w += w
-                        p = tr.gender_psum / max(tr.gender_w, 1e-6)
-                        tr.gender = "Female" if p >= 0.5 else "Male"
+                    tr.age = age
+                    tr.gender = gender
                     if tracker_backend != "embed":
                         if emb is not None:
                             mem = ext_attr.setdefault(tr.track_id, {"emb": None, "cnt": 0, "age": None, "gender": None})
@@ -1481,7 +1405,6 @@ def analyze_video(
                     run_started_jst_str,
                 ])
                 writer.writerow(row)
-                written_rows += 1
             
             # フレーム処理後にCSVをフラッシュ（データ損失防止）
             # パフォーマンス向上のため、フレーム毎ではなく適度な間隔でフラッシュ
@@ -1527,7 +1450,7 @@ def analyze_video(
                 next_ckpt_wall = now_wall + float(checkpoint_every_sec)
             if now_wall >= next_merge_wall:
                 threading.Thread(target=launch_merge_snapshot, daemon=True).start()
-                next_merge_wall = now_wall + effective_merge_sec
+                next_merge_wall = now_wall + max(60.0, float(merge_every_sec)) if merge_every_sec and merge_every_sec > 0 else now_wall + 60.0
 
             # オートチューニング: 目標時間に合わせて必要な stride を直接推定
             if target_wall_min and target_wall_min > 0 and (now_wall - start_wall) > autotune_warmup_sec and (now_wall - last_autotune_wall) > autotune_interval_sec:
@@ -1585,27 +1508,12 @@ def analyze_video(
                     frame_idx = next_pos
     finally:
         csv_file.close()
-        if raw_writer is not None and raw_file is not None:
-            try:
-                raw_file.flush()
-            except Exception:
-                pass
-            raw_file.close()
         if cap is not None:
             cap.release()
         if show_window:
             cv2.destroyAllWindows()
         if vw is not None:
             vw.release()
-        # チャンク完了の明示ログ（親プロセスがグローバル終了時刻を取得するため）
-        try:
-            fps_val = float(fps) if 'fps' in locals() else 30.0
-            current_video_sec = (frame_idx / max(1e-6, fps_val)) if 'frame_idx' in locals() else float(start_sec)
-            gstart = float(global_start_sec if global_start_sec is not None else start_sec)
-            gend = float(current_video_sec)
-            print(f"[CHUNK_COMPLETED] global_start_sec={gstart:.3f} global_end_sec={gend:.3f} rows={written_rows}", flush=True)
-        except Exception:
-            pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -1615,7 +1523,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--duration-sec", type=float, default=0.0, help="解析する秒数（0または省略で動画の最後まで）")
     p.add_argument("--output-csv", default=os.path.join("outputs", "analysis.csv"))
     p.add_argument("--output-csv-raw", default=None, help="非マージ（raw）行を併記保存するCSVパス（任意）")
-    p.add_argument("--global-start-sec", type=float, default=None, help="並列実行時に親から渡されるグローバル開始秒（省略可）")
     p.add_argument("--no-show", action="store_true", help="ウィンドウ表示を無効化")
     p.add_argument("--detect-every-n", type=int, default=5, help="Nフレーム毎に検出")
     p.add_argument("--conf", type=float, default=0.6, help="顔検出の信頼度しきい値")
@@ -1639,7 +1546,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run-id", default=None, help="出力run名に付与する任意ID")
     p.add_argument("--process-fps", type=float, default=0.0, help="1秒あたりの処理フレーム数（0で全フレーム）")
     p.add_argument("--trt-engine", default=None, help="TensorRTエンジンパス（存在すれば優先使用）")
-    p.add_argument("--no-trt-export", action="store_true", help="YOLOのTensorRTエクスポートを行わない（安定化向け）")
     p.add_argument("--yolo-weights", default="yolov8n.pt", help="YOLOの重み（例: yolov8l.pt, yolov10x.pt, カスタム.pt）")
     p.add_argument("--face-model", default="buffalo_l", help="InsightFaceモデル名（例: buffalo_l, antelopev2 など）")
     p.add_argument("--reid-backend", choices=["hist", "osnet", "ensemble"], default="hist", help="体外観埋め込みのバックエンド")
@@ -1665,10 +1571,9 @@ def main() -> None:
     analyze_video(
         video_path=args.video,
         output_csv=args.output_csv,
-        output_csv_raw=args.output_csv_raw,
         start_sec=args.start_sec,
         duration_sec=args.duration_sec,
-        global_start_sec=args.global_start_sec,
+        output_csv_raw=args.output_csv_raw,
         show_window=show_flag,
         detect_every_n=args.detect_every_n,
         conf_threshold=args.conf,
@@ -1690,7 +1595,7 @@ def main() -> None:
         no_merge=args.no_merge,
         run_id=args.run_id,
         process_fps=args.process_fps,
-        trt_engine=(None if args.no_trt_export else args.trt_engine),
+        trt_engine=args.trt_engine,
         yolo_weights=args.yolo_weights,
         face_model=args.face_model,
         reid_backend=args.reid_backend,
