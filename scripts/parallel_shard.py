@@ -472,6 +472,7 @@ def main() -> None:
         print(f"[RAW] will generate per-chunk raw files and merge to: {args.raw_output}")
         if int(args.online_merge) == 0:
             print(f"[RAW] INFO: --online-merge 0 detected, but RAW files require merging. Auto-enabling --merge-every-sec 300")
+            print(f"[RAW] DEBUG: This ensures child processes can write data to raw CSV files")
         else:
             print(f"[RAW] INFO: Using --merge-every-sec 30 for online merging")
 
@@ -635,11 +636,14 @@ def main() -> None:
             # RAWファイル生成が必要な場合は、--no-mergeを使わずに最小限のマージを有効化
             if raw_csv is not None and raw_csv.strip():
                 cmd += ["--merge-every-sec", "300"]  # 5分毎にマージ（RAWファイル生成のため）
+                print(f"[CMD-BUILD] chunk {start_s}s: RAW mode -> adding --merge-every-sec 300 (no --no-merge)")
             else:
                 cmd += ["--no-merge", "--merge-every-sec", "0"]
+                print(f"[CMD-BUILD] chunk {start_s}s: no-RAW mode -> adding --no-merge --merge-every-sec 0")
         else:
             # オンラインマージ有効時は適度な間隔でマージ
             cmd += ["--merge-every-sec", "30"]
+            print(f"[CMD-BUILD] chunk {start_s}s: online-merge mode -> adding --merge-every-sec 30")
         
         # RAWファイル生成の設定
         if raw_csv is not None and raw_csv.strip():
@@ -709,6 +713,9 @@ def main() -> None:
         if raw_csv is not None and raw_csv.strip():
             merge_flags = [flag for flag in cmd if flag in ["--no-merge", "--merge-every-sec"]]
             print(f"[CMD-DEBUG] chunk {start_s}s: merge flags = {merge_flags}")
+            # 完全なコマンド文字列も表示（デバッグ用）
+            cmd_str = " ".join(cmd)
+            print(f"[CMD-FULL] chunk {start_s}s: {cmd_str}")
         
         env = None
         if gpu_env is not None:
@@ -1202,7 +1209,8 @@ def main() -> None:
                 print(f"[RAW-WARN]   ... and {len(empty_files) - 5} more")
             print(f"[RAW-WARN] Total raw files size: {total_size} bytes")
             if int(args.online_merge) == 0:
-                print(f"[RAW-WARN] This may indicate merge settings need adjustment for RAW file generation")
+                print(f"[RAW-WARN] This may indicate --no-merge is preventing proper raw file generation")
+                print(f"[RAW-WARN] Check [CMD-DEBUG] logs above to verify merge flags are correct")
             else:
                 print(f"[RAW-WARN] This may indicate a processing issue in child processes")
         
