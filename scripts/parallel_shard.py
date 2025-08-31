@@ -928,9 +928,9 @@ def main() -> None:
                                 chunk_idx = i
                                 break
                         
-                        if chunk_idx is not None and chunk_idx < len(raw_chunks):
-                            raw_path = raw_chunks[chunk_idx][2]
-                            if os.path.exists(raw_path):
+                        if chunk_idx is not None:
+                            raw_path = raw_by_start.get(int(s))
+                            if raw_path and os.path.exists(raw_path):
                                 size = os.path.getsize(raw_path)
                                 with open(raw_path, 'r') as f:
                                     lines = f.readlines()
@@ -1405,8 +1405,9 @@ def main() -> None:
         # RAWファイルの状況をチェック
         empty_files = []
         total_size = 0
-        for (s, d, rp) in sorted(raw_chunks, key=lambda x: x[0]):
-            if os.path.exists(rp):
+        for (s, d, _) in sorted(chunks, key=lambda x: x[0]):
+            rp = raw_by_start.get(int(s))
+            if rp and os.path.exists(rp):
                 size = os.path.getsize(rp)
                 total_size += size
                 if size < 1000:  # 1KB未満は空とみなす
@@ -1427,8 +1428,9 @@ def main() -> None:
         
         with open(raw_final, "w", newline="") as fo:
             wrote_header_raw = False
-            for (s, d, rp) in sorted(raw_chunks, key=lambda x: x[0]):
-                if not os.path.exists(rp):
+            for (s, d, _) in sorted(chunks, key=lambda x: x[0]):
+                rp = raw_by_start.get(int(s))
+                if not rp or not os.path.exists(rp):
                     continue
                 with open(rp, newline="") as fi:
                     header = fi.readline().rstrip("\n")
