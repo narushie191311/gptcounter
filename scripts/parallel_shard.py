@@ -261,6 +261,7 @@ def main() -> None:
         ]
         if int(args.online_merge) == 0:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
+            print(f"[WARMUP] RAW mode: --no-merge enabled for raw feature extraction")
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
         print(f"[WARMUP] measuring throughput for {sample_sec:.1f}s on device={warmup_device} ...")
@@ -316,6 +317,7 @@ def main() -> None:
         ]
         if int(args.online_merge) == 0:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
+            print(f"[PREWARM] RAW mode: --no-merge enabled for raw feature extraction")
         if args.extra_args.strip():
             cmd += args.extra_args.strip().split()
         print("[PREWARM] starting a short run to pre-download models and warm caches...")
@@ -663,20 +665,17 @@ def main() -> None:
             cmd += ["--device", auto_device]
         # オンラインマージの制御（RAWファイル生成のためにも必要）
         if int(args.online_merge) == 0:
-            # RAWファイル生成が必要な場合は、--no-mergeを使わずに最小限のマージを有効化
+            # RAWファイル生成が必要な場合は、--no-mergeを有効化して特徴量のみ出力
             if raw_csv is not None and raw_csv.strip():
-                cmd += ["--merge-every-sec", "120"]  # 2分毎にマージ（RAWファイル生成のため、より頻繁に）
-                print(f"[CMD-BUILD] chunk {start_s}s: RAW mode -> adding --merge-every-sec 120 (no --no-merge)")
+                cmd += ["--no-merge", "--merge-every-sec", "0"]  # マージ無効、特徴量のみ出力
+                print(f"[CMD-BUILD] chunk {start_s}s: RAW mode -> adding --no-merge for raw feature extraction")
             else:
                 cmd += ["--merge-every-sec", "30"]  # 30秒毎にマージ（データ出力を確実にする）
-                print(f"[CMD-BUILD] chunk {start_s}s: no-RAW mode -> adding --merge-every-sec 30 (no --no-merge)")
+                print(f"[CMD-BUILD] chunk {start_s}s: no-RAW mode -> adding --merge-every-sec 30")
         else:
             # オンラインマージ有効時は適度な間隔でマージ
             cmd += ["--merge-every-sec", "30"]
             print(f"[CMD-BUILD] chunk {start_s}s: online-merge mode -> adding --merge-every-sec 30")
-        
-        # 強制的に--no-mergeフラグを除外（データ出力のため）
-        print(f"[CMD-BUILD] chunk {start_s}s: ensuring --no-merge is never added")
         
         # RAWファイル生成の設定
         if raw_csv is not None and raw_csv.strip():
@@ -750,12 +749,11 @@ def main() -> None:
         # デバッグ用：最終的なコマンドを表示（マージ関連のフラグが正しく処理されているか確認）
         merge_flags = [flag for flag in cmd if flag in ["--no-merge", "--merge-every-sec"]]
         print(f"[CMD-DEBUG] chunk {start_s}s: merge flags = {merge_flags}")
-        # --no-mergeフラグが含まれていないかを確認
+        # --no-mergeフラグが含まれているかを確認（RAWモード用）
         if "--no-merge" in cmd:
-            print(f"[CMD-ERROR] chunk {start_s}s: --no-merge flag is still present in command!")
-            # 緊急修正：--no-mergeフラグを強制的に削除
-            cmd = [arg for arg in cmd if arg != "--no-merge"]
-            print(f"[CMD-EMERGENCY] chunk {start_s}s: --no-merge flag forcibly removed!")
+            print(f"[CMD-INFO] chunk {start_s}s: --no-merge flag detected (RAW mode)")
+        else:
+            print(f"[CMD-INFO] chunk {start_s}s: --no-merge flag not present (normal mode)")
         # 完全なコマンド文字列も表示（デバッグ用）
         cmd_str = " ".join(cmd)
         print(f"[CMD-FULL] chunk {start_s}s: {cmd_str}")
