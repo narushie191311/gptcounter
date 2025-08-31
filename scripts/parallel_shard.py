@@ -672,8 +672,44 @@ def main() -> None:
             cmd += ["--det-size", auto_det]
         if 'auto_dn' in locals() and not _has_flag("--detect-every-n"):
             cmd += ["--detect-every-n", str(auto_dn)]
+        
+        # フィルタリングされたextra-argsを追加（マージ関連のフラグを除外）
         if extra:
-            cmd += extra.split()
+            # マージ関連のフラグを除外して、RAWファイル生成との競合を防ぐ
+            filtered_extra = []
+            filtered_out = []
+            try:
+                import shlex
+                tokens = shlex.split(extra)
+            except Exception:
+                tokens = extra.split()
+            
+            i = 0
+            while i < len(tokens):
+                token = tokens[i]
+                # マージ関連のフラグをスキップ
+                if token in ["--no-merge", "--merge-every-sec", "--online-merge"]:
+                    filtered_out.append(token)
+                    i += 1  # フラグをスキップ
+                    continue
+                # --merge-every-secの値もスキップ
+                if i > 0 and tokens[i-1] == "--merge-every-sec":
+                    filtered_out.append(token)
+                    i += 1
+                    continue
+                filtered_extra.append(token)
+                i += 1
+            
+            if filtered_out:
+                print(f"[CMD-FILTER] filtered out merge flags: {' '.join(filtered_out)}")
+            if filtered_extra:
+                cmd += filtered_extra
+        
+        # デバッグ用：最終的なコマンドを表示（マージ関連のフラグが正しく処理されているか確認）
+        if raw_csv is not None and raw_csv.strip():
+            merge_flags = [flag for flag in cmd if flag in ["--no-merge", "--merge-every-sec"]]
+            print(f"[CMD-DEBUG] chunk {start_s}s: merge flags = {merge_flags}")
+        
         env = None
         if gpu_env is not None:
             env = os.environ.copy()
