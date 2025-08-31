@@ -632,6 +632,7 @@ def analyze_video(
     face_model: str = "buffalo_l",
     reid_backend: str = "hist",
     gait_features: bool = False,
+    global_start_sec: float = 0.0,
 ) -> None:
     # 現在の可変パラメータ（オートチューニング対象）
     current_det_w, current_det_h = int(det_size[0]), int(det_size[1])
@@ -1214,7 +1215,7 @@ def analyze_video(
                     # タイムスタンプ計算
                     relative_sec = current_time_sec - start_sec
                     ts_str = format_timestamp(relative_sec)
-                    ts_from_file_start = format_timestamp(current_time_sec)
+                    ts_from_file_start = format_timestamp(current_time_sec + global_start_sec)
                     
                     # 絶対時刻（JST）
                     abs_ts = ""
@@ -1378,7 +1379,7 @@ def analyze_video(
                         emb_b64 = ""
                 ts_out = abs_ts if abs_ts else ts_str
                 # 動画ファイル開始からの相対（start_secを引かない）
-                ts_from_file_start = format_timestamp(current_time_sec)
+                ts_from_file_start = format_timestamp(current_time_sec + global_start_sec)
                 row = [
                     ts_str,
                     ts_from_file_start,
@@ -1550,6 +1551,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--face-model", default="buffalo_l", help="InsightFaceモデル名（例: buffalo_l, antelopev2 など）")
     p.add_argument("--reid-backend", choices=["hist", "osnet", "ensemble"], default="hist", help="体外観埋め込みのバックエンド")
     p.add_argument("--gait-features", action="store_true", help="幾何的歩容特徴を体埋め込みに追加")
+    p.add_argument("--global-start-sec", type=float, default=0.0, help="グローバル開始秒（並列処理用）")
+    p.add_argument("--no-trt-export", action="store_true", help="TensorRTエクスポートを無効化")
     return p.parse_args()
 
 
@@ -1600,6 +1603,7 @@ def main() -> None:
         face_model=args.face_model,
         reid_backend=args.reid_backend,
         gait_features=args.gait_features,
+        global_start_sec=args.global_start_sec,
     )
 
 
