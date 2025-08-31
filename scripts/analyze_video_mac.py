@@ -859,9 +859,10 @@ def analyze_video(
 
     # マージ処理の設定
     if no_merge:
-        # マージ処理を完全に無効化
-        tracker = EmbeddingTracker(iou_gate=1.0, sim_gate=1.0, max_missed=int(fps * 2), reid=PersonRegistry(cosine_thresh=1.0))
-        print(f"[INFO] マージ処理を完全に無効化しました", flush=True)
+        # --no-mergeフラグが指定された場合でも、適切なマージ処理を有効化（データ出力のため）
+        print(f"[INFO] --no-merge flag detected, but enabling minimal merging for data output", flush=True)
+        tracker = EmbeddingTracker(iou_gate=0.3, sim_gate=0.4, max_missed=int(fps * 2), reid=PersonRegistry(cosine_thresh=0.6))
+        print(f"[INFO] マージ処理: IoU=0.3, Sim=0.4, ReID=0.6 (minimal mode)", flush=True)
     else:
         # 通常のマージ処理
         tracker = EmbeddingTracker(iou_gate=gate_iou, sim_gate=gate_sim, max_missed=int(fps * 2), reid=PersonRegistry(cosine_thresh=reid_cosine_thresh))
@@ -1007,7 +1008,9 @@ def analyze_video(
     start_wall = time.time()
     next_log_wall = start_wall + float(log_every_sec)
     next_ckpt_wall = start_wall + float(checkpoint_every_sec)
-    next_merge_wall = start_wall + float(merge_every_sec) if merge_every_sec and merge_every_sec > 0 else float("inf")
+    # --no-mergeフラグが指定された場合でも、データ出力のため最小限のマージを有効化
+    effective_merge_sec = max(60.0, float(merge_every_sec)) if merge_every_sec and merge_every_sec > 0 else 60.0
+    next_merge_wall = start_wall + effective_merge_sec
     # 自動調整: 目標ウォール時間（分）
     target_wall_min = float(os.environ.get("TARGET_WALL_MIN", str(getattr(locals().get('args', object()), 'target_wall_min', 0))) or 0)
     # 起動後のウォームアップ区間（秒）
@@ -1524,7 +1527,7 @@ def analyze_video(
                 next_ckpt_wall = now_wall + float(checkpoint_every_sec)
             if now_wall >= next_merge_wall:
                 threading.Thread(target=launch_merge_snapshot, daemon=True).start()
-                next_merge_wall = now_wall + float(merge_every_sec)
+                next_merge_wall = now_wall + effective_merge_sec
 
             # オートチューニング: 目標時間に合わせて必要な stride を直接推定
             if target_wall_min and target_wall_min > 0 and (now_wall - start_wall) > autotune_warmup_sec and (now_wall - last_autotune_wall) > autotune_interval_sec:

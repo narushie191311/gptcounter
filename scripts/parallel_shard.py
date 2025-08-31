@@ -640,8 +640,8 @@ def main() -> None:
                 cmd += ["--merge-every-sec", "300"]  # 5分毎にマージ（RAWファイル生成のため）
                 print(f"[CMD-BUILD] chunk {start_s}s: RAW mode -> adding --merge-every-sec 300 (no --no-merge)")
             else:
-                cmd += ["--no-merge", "--merge-every-sec", "0"]
-                print(f"[CMD-BUILD] chunk {start_s}s: no-RAW mode -> adding --no-merge --merge-every-sec 0")
+                cmd += ["--merge-every-sec", "60"]  # --no-mergeを使わず、適度なマージを有効化
+                print(f"[CMD-BUILD] chunk {start_s}s: no-RAW mode -> adding --merge-every-sec 60 (no --no-merge)")
         else:
             # オンラインマージ有効時は適度な間隔でマージ
             cmd += ["--merge-every-sec", "30"]
@@ -653,7 +653,7 @@ def main() -> None:
                 cmd += ["--output-csv-raw", raw_csv]
 
         # Inject auto-quality defaults if not overridden
-        extra = args.extra_args.strip()
+        # extra変数は既に上で定義済みなので、ここでは再定義しない
         def _has_flag(flag: str) -> bool:
             """Return True if the flag (e.g., "--det-size") is present in extra-args tokens.
             This performs exact token checks and also matches "--flag=value" forms.
@@ -718,6 +718,9 @@ def main() -> None:
         # --no-mergeフラグが含まれていないかを確認
         if "--no-merge" in cmd:
             print(f"[CMD-ERROR] chunk {start_s}s: --no-merge flag is still present in command!")
+            # 緊急修正：--no-mergeフラグを強制的に削除
+            cmd = [arg for arg in cmd if arg != "--no-merge"]
+            print(f"[CMD-EMERGENCY] chunk {start_s}s: --no-merge flag forcibly removed!")
         # 完全なコマンド文字列も表示（デバッグ用）
         cmd_str = " ".join(cmd)
         print(f"[CMD-FULL] chunk {start_s}s: {cmd_str}")
