@@ -827,6 +827,30 @@ def main() -> None:
                     perc = float(m.group(1)) / 100.0
                     with lock:
                         progress_map[start_key] = max(0.0, min(1.0, perc))
+                
+                # RAWファイルの進捗も定期的にチェック（PROGRESSログの時のみ）
+                if args.raw_output.strip() and perc > 0.1:  # 10%以上進捗がある場合
+                    try:
+                        # 対応するRAWファイルの状況をチェック
+                        chunk_idx = None
+                        for i, (s, d, _) in enumerate(chunks):
+                            if abs(s - start_key) < 1.0:  # 開始時刻が一致
+                                chunk_idx = i
+                                break
+                        
+                        if chunk_idx is not None and chunk_idx < len(raw_chunks):
+                            raw_path = raw_chunks[chunk_idx][2]
+                            if os.path.exists(raw_path):
+                                size = os.path.getsize(raw_path)
+                                with open(raw_path, 'r') as f:
+                                    lines = f.readlines()
+                                    rows = max(0, len(lines) - 1)  # ヘッダーを除く
+                                
+                                # 進捗が25%、50%、75%の時にRAWファイル状況をログ出力
+                                if perc in [0.25, 0.5, 0.75] or (perc > 0.9 and perc < 0.95):
+                                    print(f"[RAW-PROGRESS] chunk {start_key}s ({perc*100:.0f}%): {size:,} bytes, {rows:,} rows")
+                    except Exception as e:
+                        pass  # エラーは静かに無視
                 # 行頭の [HH:MM:SS(.mmm)] を拾って動画内時刻をレジューム状態に記録
                 tm = re.search(r"^\[([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,3}))?\]", line.strip())
                 if tm:
@@ -848,6 +872,28 @@ def main() -> None:
                 # 完了時は100%に
                 with lock:
                     progress_map[start_key] = 1.0
+                
+                # RAWファイルの進捗も記録
+                if args.raw_output.strip():
+                    try:
+                        # 対応するRAWファイルの状況をチェック
+                        chunk_idx = None
+                        for i, (s, d, _) in enumerate(chunks):
+                            if abs(s - start_key) < 1.0:  # 開始時刻が一致
+                                chunk_idx = i
+                                break
+                        
+                        if chunk_idx is not None and chunk_idx < len(raw_chunks):
+                            raw_path = raw_chunks[chunk_idx][2]
+                            if os.path.exists(raw_path):
+                                size = os.path.getsize(raw_path)
+                                with open(raw_path, 'r') as f:
+                                    lines = f.readlines()
+                                    rows = max(0, len(lines) - 1)  # ヘッダーを除く
+                                
+                                print(f"[RAW-CHUNK-COMPLETED] chunk {start_key}s: {size:,} bytes, {rows:,} rows")
+                    except Exception as e:
+                        print(f"[RAW-PROGRESS-ERROR] chunk {start_key}s: {e}")
         except Exception:
             pass
 
@@ -1083,6 +1129,64 @@ def main() -> None:
         else:
             raise SystemExit(f"some shards failed: {rcodes}")
 
+    # RAWファイルの進捗監視とログ出力
+    def monitor_raw_progress():
+        """RAWファイルの進捗を定期的に監視し、詳細なログを出力"""
+        last_check = time.time()
+        check_interval = 30.0  # 30秒毎にチェック
+        
+        while not stop_monitor:
+            try:
+                time.sleep(1.0)  # 1秒毎にチェック
+                now = time.time()
+                
+                if now - last_check >= check_interval:
+                    last_check = now
+                    
+                    # 各RAWファイルの状況をチェック
+                    total_raw_size = 0
+                    total_raw_rows = 0
+                    active_chunks = 0
+                    
+                    for i, (s, d, rp) in enumerate(raw_chunks):
+                        if os.path.exists(rp):
+                            try:
+                                size = os.path.getsize(rp)
+                                total_raw_size += size
+                                
+                                # 行数をカウント
+                                with open(rp, 'r') as f:
+                                    lines = f.readlines()
+                                    rows = max(0, len(lines) - 1)  # ヘッダーを除く
+                                    total_raw_rows += rows
+                                
+                                if size > 1000:  # 1KB以上はアクティブ
+                                    active_chunks += 1
+                                    
+                                # 個別チャンクの詳細ログ（最初の5個のみ）
+                                if i < 5:
+                                    print(f"[RAW-PROGRESS] chunk {s}s: {size} bytes, {rows} rows")
+                                    
+                            except Exception as e:
+                                print(f"[RAW-ERROR] chunk {s}s: {e}")
+                    
+                    # 全体の進捗サマリー
+                    elapsed = now - t_main
+                    if total_sec > 0:
+                        processed_frac = (total_done / total_sec) * 100 if 'total_done' in locals() else 0.0
+                        print(f"[RAW-SUMMARY] {elapsed/60:.1f}m elapsed: {total_raw_size:,} bytes, {total_raw_rows:,} rows, {active_chunks}/{len(raw_chunks)} active chunks ({processed_frac:.1f}% processed)")
+                    
+            except Exception as e:
+                print(f"[RAW-MONITOR-ERROR] {e}")
+                time.sleep(5.0)  # エラー時は5秒待機
+    
+    # RAWファイル監視スレッドを開始
+    raw_monitor_thread = None
+    if args.raw_output.strip():
+        raw_monitor_thread = threading.Thread(target=monitor_raw_progress, daemon=True)
+        raw_monitor_thread.start()
+        print(f"[RAW-MONITOR] Started RAW file progress monitoring (30s intervals)")
+    
     # 連結（ヘッダは先頭のみ）かつ timestamp を動画全体の相対に正規化
     final_out = os.path.join(out_dir, f"{base_name}_{video_id}_merged.csv")
     with open(final_out, "w", newline="") as fo:
