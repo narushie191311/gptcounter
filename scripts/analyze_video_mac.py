@@ -41,7 +41,6 @@ except Exception:
     torchreid = None
 import base64
 from scipy.optimize import linear_sum_assignment
-import base64
 
 
 def warn(tag: str, e: Exception) -> None:
@@ -67,17 +66,13 @@ def parse_video_start_datetime(video_path: str) -> Optional[datetime]:
         if m:
             ymd = m.group(1)
             hhmm = m.group(2)
-            dt = datetime.strptime(ymd + hhmm, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
-            # 入力はJST想定なので、TZをJSTに合わせたい場合は以下を使用
+            dt_naive = datetime.strptime(ymd + hhmm, "%Y%m%d%H%M")
+            # デフォルトでJSTにする（ZoneInfoが無ければ固定オフセット）
             try:
-                jst = ZoneInfo("Asia/Tokyo") if ZoneInfo else None
+                jst = ZoneInfo("Asia/Tokyo") if ZoneInfo else timezone(timedelta(hours=9))
             except Exception:
-                jst = None
-            if jst:
-                # 一旦naiveで作ってJST付与
-                dt_naive = datetime.strptime(ymd + hhmm, "%Y%m%d%H%M")
-                return dt_naive.replace(tzinfo=jst)
-            return dt  # フォールバック（UTC）
+                jst = timezone(timedelta(hours=9))
+            return dt_naive.replace(tzinfo=jst)
     return None
 
 
@@ -86,16 +81,8 @@ def init_face_app(det_w: int = 640, det_h: int = 640, device: str = "auto", face
     requested_cuda = device.lower() in ("cuda", "gpu")
     cuda_available = torch.cuda.is_available()
     providers_try = []
-    
-    # CUDA初期化エラーが発生した場合のフォールバック処理
     if requested_cuda or (device.lower() == "auto" and cuda_available):
-        try:
-            # まずCUDAプロバイダーを試行
-            providers_try.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
-        except Exception:
-            print(f"[WARN] CUDA初期化に失敗、CPUにフォールバックします", flush=True)
-            providers_try.append(["CPUExecutionProvider"])
-    
+        providers_try.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
     providers_try.append(["CPUExecutionProvider"])  # 最終フォールバック
 
     last_err = None
@@ -1220,10 +1207,29 @@ def analyze_video(
 
     try:
         # フレームイテレータ（PyAV/OpenCV）
-        if dec_kind == "pyav":
+        # OpenCV純正のフォールバックイテレータ
+        def frames_opencv_baseline(video_path: str, start_sec: float, duration_sec: float):
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise RuntimeError(f"動画を開けません: {video_path}")
+            if start_sec > 0:
+                cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
+            end_msec = None if (not duration_sec or duration_sec <= 0) else (start_sec + duration_sec) * 1000.0
+            while True:
+                ok, f = cap.read()
+                if not ok:
+                    break
+                if end_msec is not None:
+                    pos = cap.get(cv2.CAP_PROP_POS_MSEC)
+                    if pos > end_msec:
+                        break
+                yield f
+            cap.release()
+
+        if dec_kind == "pyav" and (_dec is not None) and hasattr(_dec, "frames_pyav"):
             frame_iter = _dec.frames_pyav(video_path, start_sec=start_sec, duration_sec=duration_sec, **dec_kwargs)
         else:
-            frame_iter = _dec.frames_opencv(video_path, start_sec=start_sec, duration_sec=duration_sec)
+            frame_iter = frames_opencv_baseline(video_path, start_sec=start_sec, duration_sec=duration_sec)
 
         # 初期化：ROI判定で参照するための人物ボックス
         person_boxes: List[Tuple[Tuple[int, int, int, int], float]] = []
@@ -1341,6 +1347,8 @@ def analyze_video(
             # --no-mergeモードの場合：トラッキングをスキップして直接CSVに書き込み
             if no_merge:
                 # 検出された各顔を直接CSVに書く（1検出=1行）
+                if 'raw_uid' not in locals():
+                    raw_uid = 0
                 for i, ((fx, fy, fw, fh), conf, (age, gender, fused)) in enumerate(zip(boxes, confidences, det_attrs)):
                     fsize, sharp = 0.0, 0.0
                     try:
@@ -1375,9 +1383,10 @@ def analyze_video(
                             abs_ts = abs_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                         except Exception:
                             abs_ts = ""
+                    raw_uid += 1
                     row = [
                         ts_str, ts_from_file_start, frame_idx,
-                        i, i,
+                        raw_uid, raw_uid,
                         age if age else "", gender if gender else "",
                         fx, fy, fw, fh,
                         f"{conf:.3f}",
