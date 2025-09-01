@@ -1027,13 +1027,20 @@ def main() -> None:
     def _gpu_monitor():
         while not stop_gpu_monitor:
             try:
-                out = subprocess.check_output(["nvidia-smi", "--query-gpu=index,utilization.gpu,utilization.memory,memory.used,memory.total", "--format=csv,noheader,nounits"], text=True)
+                out = subprocess.check_output(["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,memory.total", "--format=csv,noheader"], text=True)
                 lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
                 view = []
                 for ln in lines:
+                    # 例: 0, 45 %, 8243 MiB, 40960 MiB
                     parts = [p.strip() for p in ln.split(',')]
-                    if len(parts) >= 5:
-                        view.append(f"id={parts[0]} gpu={parts[1]}% mem={parts[3]}/{parts[4]}MB")
+                    if len(parts) >= 4:
+                        gid = parts[0]
+                        util = ''.join(ch for ch in parts[1] if ch.isdigit()) or "0"
+                        import re
+                        m_used = re.search(r"(\d+)", parts[2])
+                        m_tot = re.search(r"(\d+)", parts[3])
+                        if m_used and m_tot:
+                            view.append(f"id={gid} gpu={util}% mem={m_used.group(1)}/{m_tot.group(1)}MB")
                 if view:
                     print(f"[GPU] {' | '.join(view)}")
             except Exception:

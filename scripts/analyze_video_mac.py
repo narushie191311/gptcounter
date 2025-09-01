@@ -1067,7 +1067,11 @@ def analyze_video(
     
     # 開始時のログ出力
     if video_dt is not None:
-        start_time_str = video_dt.strftime("%H:%M:%S")
+        try:
+            # チャンク開始の時計時刻 = ファイル開始時刻 + start_sec
+            start_time_str = (video_dt + timedelta(seconds=float(start_sec))).strftime("%H:%M:%S")
+        except Exception:
+            start_time_str = video_dt.strftime("%H:%M:%S")
         print(f"[INFO] 解析開始: 動画時刻 {start_time_str} から開始します", flush=True)
     if duration_sec and duration_sec > 0:
         print(f"[INFO] 解析範囲: {start_sec}秒目から {duration_sec}秒間", flush=True)
@@ -1644,9 +1648,10 @@ def analyze_video(
                     cap.set(cv2.CAP_PROP_POS_FRAMES, next_pos)
                     frame_idx = next_pos
     finally:
-        # 親用完了フック（最後の現在時刻を通知）
+        # 親の完了検知用フック（s: チャンク開始秒, dur: チャンク長秒）
         try:
-            print(f"[CHUNK_COMPLETED] global_end_sec={current_time_sec:.3f}", flush=True)
+            chunk_dur_sec = float(duration_sec) if (duration_sec and duration_sec > 0) else max(0.0, float(current_time_sec - start_sec))
+            print(f"[CHUNK_COMPLETED] s={start_sec:.3f} dur={chunk_dur_sec:.3f}", flush=True)
         except Exception:
             pass
         csv_file.close()
