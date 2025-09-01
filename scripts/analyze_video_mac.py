@@ -1355,7 +1355,15 @@ def analyze_video(
                             emb_b64 = ""
                     relative_sec = current_time_sec - start_sec
                     ts_str = format_timestamp(relative_sec)
-                    ts_from_file_start = format_timestamp(current_time_sec)
+                    # ファイル名から抽出した開始時刻がある場合は、その時刻からの絶対（時刻）を出力
+                    if video_dt is not None:
+                        try:
+                            vdt = (video_dt + timedelta(seconds=float(current_time_sec)))
+                            ts_from_file_start = vdt.strftime("%H:%M:%S.%f")[:-3]
+                        except Exception:
+                            ts_from_file_start = format_timestamp(current_time_sec)
+                    else:
+                        ts_from_file_start = format_timestamp(current_time_sec)
                     abs_ts = ""
                     if video_dt is not None:
                         try:
@@ -1499,7 +1507,15 @@ def analyze_video(
                         emb_b64 = ""
                 ts_out = abs_ts if abs_ts else ts_str
                 # 動画ファイル開始からの相対（start_secを引かない）
-                ts_from_file_start = format_timestamp(current_time_sec)
+                # ファイル名から抽出した開始時刻がある場合は、その時刻からの絶対（時刻）を出力
+                if video_dt is not None:
+                    try:
+                        vdt = (video_dt + timedelta(seconds=float(current_time_sec)))
+                        ts_from_file_start = vdt.strftime("%H:%M:%S.%f")[:-3]
+                    except Exception:
+                        ts_from_file_start = format_timestamp(current_time_sec)
+                else:
+                    ts_from_file_start = format_timestamp(current_time_sec)
                 row = [
                     ts_str,
                     ts_from_file_start,
