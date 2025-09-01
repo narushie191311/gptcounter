@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from datetime import datetime, timedelta
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import json
 
 import cv2
@@ -458,13 +458,15 @@ def main() -> None:
     overlap_sec = 2.0  # チャンク境界のオーバーラップ（検出/追跡の切れを防ぐ）
     while cur < total_sec or (total_sec == 0 and idx == 0):
         this_chunk = tail_chunk_sec if (total_sec > 0 and cur >= tail_start) else chunk_sec
-        dur = this_chunk if (total_sec <= 0 or cur + this_chunk < total_sec) else max(0.0, total_sec - cur)
         start_s = max(0.0, cur)
-        # 最終チャンクは末尾まで（duration=0）
-        if total_sec > 0 and cur + this_chunk >= total_sec:
+        if total_sec <= 0:
+            # 総尺が不明 → 最初の1チャンクを EOF まで走らせる
             dur = 0.0
         else:
-            # 末尾以外のチャンクにオーバーラップを追加
+            # 最終チャンク判定は this_chunk で行う
+            dur = this_chunk if (cur + this_chunk < total_sec) else 0.0
+        # 末尾以外のチャンクにオーバーラップを追加
+        if dur != 0.0:
             dur += overlap_sec
         
         out_path = os.path.join(work_dir, f"{base_name}_chunk_{int(start_s)}s.csv")
@@ -545,7 +547,7 @@ def main() -> None:
             return None
 
     covered: List[Tuple[float, float]] = []
-    if int(args.skip_existing) == 1:
+    if int(args.skip_existing) == 1 and total_sec > 0:
         # 旧shardファイル
         for name in os.listdir(work_dir):
             if not name.startswith(base_name + "_"):
@@ -579,6 +581,10 @@ def main() -> None:
                 continue
             filtered.append((s, d, op))
         chunks = filtered
+        # RAWマッピングも同様にフィルタ（raw_by_start維持）
+        if args.raw_output.strip():
+            keep_starts = {int(s) for (s, _, _) in chunks}
+            raw_by_start = {int(s): p for (s, p) in raw_by_start.items() if int(s) in keep_starts}
 
     # 親プロセスのレジューム状態ファイル（子ログからの進捗も記録）
     resume_state_path = os.path.join(work_dir, "chunk_resume_state.json")
@@ -713,38 +719,38 @@ def main() -> None:
             cmd += ["--detect-every-n", str(auto_dn)]
             print(f"[CMD-AUTO] chunk {start_s}s: injected --detect-every-n {auto_dn}")
         
-        # フィルタリングされたextra-argsを追加（マージ関連のフラグを除外）
+        # フィルタリングされたextra-argsを追加（online_merge=0 の場合のみマージ関連のフラグを除外）
         if extra:
-            # マージ関連のフラグを除外して、RAWファイル生成との競合を防ぐ
-            filtered_extra = []
-            filtered_out = []
             try:
                 import shlex
                 tokens = shlex.split(extra)
             except Exception:
                 tokens = extra.split()
-            
-            i = 0
-            while i < len(tokens):
-                token = tokens[i]
-                # マージ関連のフラグをスキップ
-                if token in ["--no-merge", "--merge-every-sec", "--online-merge"]:
-                    filtered_out.append(token)
-                    i += 1  # フラグをスキップ
-                    continue
-                # --merge-every-secの値もスキップ
-                if i > 0 and tokens[i-1] == "--merge-every-sec":
-                    filtered_out.append(token)
+            filtered_extra = []
+            filtered_out = []
+            if int(args.online_merge) == 0:
+                i = 0
+                while i < len(tokens):
+                    token = tokens[i]
+                    # マージ関連のフラグをスキップ
+                    if token in ["--no-merge", "--merge-every-sec", "--online-merge"]:
+                        filtered_out.append(token)
+                        i += 1
+                        # 値付きの --merge-every-sec を丸ごと外す
+                        if token == "--merge-every-sec" and i < len(tokens):
+                            filtered_out.append(tokens[i])
+                            i += 1
+                        continue
+                    filtered_extra.append(token)
                     i += 1
-                    continue
-                filtered_extra.append(token)
-                i += 1
-            
-            if filtered_out:
-                print(f"[CMD-FILTER] filtered out merge flags: {' '.join(filtered_out)}")
-            if filtered_extra:
-                print(f"[CMD-FILTER] remaining extra args: {' '.join(filtered_extra)}")
+                if filtered_out:
+                    print(f"[CMD-FILTER] filtered out merge flags: {' '.join(filtered_out)}")
+                if filtered_extra:
+                    print(f"[CMD-FILTER] remaining extra args: {' '.join(filtered_extra)}")
                 cmd += filtered_extra
+            else:
+                # online-merge が有効な場合は extra-args をそのまま適用
+                cmd += tokens
         
         # デバッグ用：最終的なコマンドを表示（マージ関連のフラグが正しく処理されているか確認）
         merge_flags = [flag for flag in cmd if flag in ["--no-merge", "--merge-every-sec"]]
@@ -1039,16 +1045,16 @@ def main() -> None:
         mon_thread = threading.Thread(target=_gpu_monitor, daemon=True)
         mon_thread.start()
 
-    try:
-        mon = threading.Thread(target=_global_progress_printer, daemon=True)
-        mon.start()
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = []
-            for i, (s, d, op) in enumerate(chunks):
-                # GPUをラウンドロビン割り当て
-                gpu_env = None
-                if gpu_ids:
-                    gpu_env = gpu_ids[i % len(gpu_ids)]
+    # グローバル進捗スレッド起動
+    mon = threading.Thread(target=_global_progress_printer, daemon=True)
+    mon.start()
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = []
+        for i, (s, d, op) in enumerate(chunks):
+            # GPUをラウンドロビン割り当て
+            gpu_env = None
+            if gpu_ids:
+                gpu_env = gpu_ids[i % len(gpu_ids)]
                 raw_op = None
                 if args.raw_output.strip():
                     # use start_sec to look up raw file path
@@ -1110,7 +1116,7 @@ def main() -> None:
                         rc = run_proc_streaming(c2, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)))
                     return (rc, start_sec, dur, out_path)
                 futs.append(ex.submit(worker))
-            for fut in as_completed(futs):
+        for fut in as_completed(futs):
                 rc, start_sec_done, dur_done, out_csv_path = fut.result()
                 rcodes.append(rc)
                 if rc == 0 and total_sec > 0:
@@ -1162,9 +1168,11 @@ def main() -> None:
                     remain_video = max(0.0, float(total_sec) - total_done)
                     remain_sec = remain_video / max(1e-6, est_speed)
                     print(f"[GLOBAL] processed={total_done:.1f}s ({done_frac:.2f}%) | elapsed={elapsed/60:.1f}m ETA={_format_eta(remain_sec)}")
+    # シャットダウン処理
+    try:
+        pass
     except KeyboardInterrupt:
         print("\n[PARALLEL] KeyboardInterrupt received. Waiting for running tasks to terminate...")
-        # The streaming function will exit when processes are killed by the environment/user.
         raise
     finally:
         stop_gpu_monitor = True  # GPU監視のみ停止
@@ -1244,7 +1252,7 @@ def main() -> None:
             raw_monitor_thread.join(timeout=5.0)  # 5秒でタイムアウト
     except Exception as e:
         print(f"[RAW-MONITOR] Error stopping monitor thread: {e}")
-    
+
     # 連結（ヘッダは先頭のみ）かつ timestamp を動画全体の相対に正規化
     final_out = os.path.join(out_dir, f"{base_name}_{video_id}_merged.csv")
     with open(final_out, "w", newline="") as fo:
@@ -1287,8 +1295,8 @@ def main() -> None:
                             h, m, rest = v.split(":")
                             if "." in rest:
                                 sec, ms = rest.split(".")
-                            else:
-                                sec, ms = rest, "0"
+                        else:
+                            sec, ms = rest, "0"
                             current_ts = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
                     except Exception:
                         pass
@@ -1309,8 +1317,8 @@ def main() -> None:
                             h, m, rest = v.split(":")
                             if "." in rest:
                                 sec, ms = rest.split(".")
-                            else:
-                                sec, ms = rest, "0"
+                        else:
+                            sec, ms = rest, "0"
                             base_s = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
                         if base_s is not None and video_start_dt is not None:
                             dt = video_start_dt + timedelta(seconds=float(base_s))

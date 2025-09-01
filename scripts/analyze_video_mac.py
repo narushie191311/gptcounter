@@ -802,7 +802,11 @@ def analyze_video(
 
     # デコーダ選択（自動）: PyAV+NVDEC/VideoToolbox 優先、フォールバックはOpenCV
     prefer_hw = (device.lower() in ("cuda", "auto")) or (sys.platform == 'darwin')
-    dec_kind, dec_kwargs = _dec.select_decoder(prefer_hw=prefer_hw)
+    # デコーダ安全化：_dec が無い/関数が無い場合は OpenCV へフォールバック
+    if _dec is None or not hasattr(_dec, "select_decoder"):
+        dec_kind, dec_kwargs = "opencv", {}
+    else:
+        dec_kind, dec_kwargs = _dec.select_decoder(prefer_hw=prefer_hw)
     cap = None
     # FPSはPyAVでは逐次取得するため近似で30を利用（進捗・ETAにのみ使用）
     fps = 30.0
@@ -896,10 +900,6 @@ def analyze_video(
     if cap is not None and resume_mode and (last_written_frame is not None) and last_written_frame > 0:
         target_frame = int(last_written_frame)
         start_sec = float(target_frame) / float(fps)
-        try:
-            print(f"[RESUME] last_frame={last_written_frame} -> seek to {start_sec:.2f}s and append to: {effective_csv_path}", flush=True)
-        except Exception:
-            pass
     else:
         target_frame = int(round(start_sec * fps))
         if cap is not None:
@@ -1221,8 +1221,15 @@ def analyze_video(
         else:
             frame_iter = _dec.frames_opencv(video_path, start_sec=start_sec, duration_sec=duration_sec)
 
+        # 初期化：ROI判定で参照するための人物ボックス
+        person_boxes: List[Tuple[Tuple[int, int, int, int], float]] = []
+
         for frame in frame_iter:
             frame_idx += 1
+            # PyAV経路でもフレーム間引き（OpenCVと同等の効果）
+            if stride_frames > 1 and dec_kind == "pyav":
+                if (frame_idx - start_frame_pos - 1) % stride_frames != 0:
+                    continue
 
             current_time_sec = frame_idx / fps
             # start_secからの相対時間を計算
@@ -1244,19 +1251,20 @@ def analyze_video(
             confidences: List[float] = []
             det_attrs: List[Tuple[int, str, Optional[np.ndarray]]] = []  # (age, gender, fused_emb)
             if do_detect:
-                # ROI Face（人数が多い時に自動切替）
-                MAX_FULLFRAME_FACES = 6  # この人数を超えたら ROI モード
-                use_roi_face = len(person_boxes) >= MAX_FULLFRAME_FACES
-                
-                if use_roi_face:
-                    print(f"[ROI-FACE] 人数多({len(person_boxes)}) → ROI Face モード切替", flush=True)
-                    dets = detect_faces_roi(face_app, frame, person_boxes, conf_threshold=conf_threshold)
-                else:
-                    dets = detect_faces_and_attrs(face_app, frame, conf_threshold=conf_threshold)
-                # YOLOの入力解像度を顔検出サイズと揃える（短辺基準）
+                # 先にYOLOで人物検出（ROI判定に使用）
                 short_side = min(current_det_w, current_det_h)
                 yolo_use_half = torch.cuda.is_available() and (device.lower() in ("auto", "cuda", "gpu"))
-                person_boxes = detect_person_boxes(yolo, frame, conf=body_conf, imgsz=short_side, use_half=yolo_use_half)
+                person_boxes = detect_person_boxes(
+                    yolo, frame, conf=body_conf, imgsz=short_side, use_half=yolo_use_half
+                )
+                # 人数が多い場合はROI Faceへ切替
+                MAX_FULLFRAME_FACES = 6
+                use_roi_face = len(person_boxes) >= MAX_FULLFRAME_FACES
+                dets = (
+                    detect_faces_roi(face_app, frame, person_boxes, conf_threshold=conf_threshold)
+                    if use_roi_face else
+                    detect_faces_and_attrs(face_app, frame, conf_threshold=conf_threshold)
+                )
                 last_detect_frame = frame_idx
                 used_person_indices: Set[int] = set()
                 det_quality_weights: List[float] = []
@@ -1347,7 +1355,7 @@ def analyze_video(
                             emb_b64 = ""
                     relative_sec = current_time_sec - start_sec
                     ts_str = format_timestamp(relative_sec)
-                    ts_from_file_start = format_timestamp(current_time_sec + global_start_sec)
+                    ts_from_file_start = format_timestamp(current_time_sec)
                     abs_ts = ""
                     if video_dt is not None:
                         try:
@@ -1485,12 +1493,13 @@ def analyze_video(
                         tr.gender = str(mem.get("gender"))
                 if emb_src is not None:
                     try:
-                        emb_b64 = base64.b64encode(np.asarray(emb_src, dtype=np.float32).tobytes()).decode("ascii")
+                        vec16 = np.asarray(emb_src, dtype=np.float16)
+                        emb_b64 = base64.b64encode(vec16.tobytes()).decode("ascii")
                     except Exception:
                         emb_b64 = ""
                 ts_out = abs_ts if abs_ts else ts_str
                 # 動画ファイル開始からの相対（start_secを引かない）
-                ts_from_file_start = format_timestamp(current_time_sec + global_start_sec)
+                ts_from_file_start = format_timestamp(current_time_sec)
                 row = [
                     ts_str,
                     ts_from_file_start,
@@ -1619,6 +1628,11 @@ def analyze_video(
                     cap.set(cv2.CAP_PROP_POS_FRAMES, next_pos)
                     frame_idx = next_pos
     finally:
+        # 親用完了フック（最後の現在時刻を通知）
+        try:
+            print(f"[CHUNK_COMPLETED] global_end_sec={current_time_sec:.3f}", flush=True)
+        except Exception:
+            pass
         csv_file.close()
         if cap is not None:
             cap.release()
