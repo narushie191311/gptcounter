@@ -757,13 +757,34 @@ def main() -> None:
             except Exception:
                 st = None
             if st is not None and st > s + 1.0:
-                cand_new_s = st
+                cand_new_s = float(st)
+                # clamp resume point into this chunk span (or to total length if tail)
+                if total_sec > 0:
+                    upper = (float(s + d) if d > 0.0 else float(total_sec))
+                    if cand_new_s > upper:
+                        print(f"[RESUME-STATE] clamp resume: {int(s)}s -> {int(upper)}s (st={int(cand_new_s)} > upper)")
+                        cand_new_s = upper
+                # recompute remaining duration
                 cand_new_d = (max(0.0, float(total_sec) - cand_new_s) if (d == 0.0 and total_sec > 0) else max(0.0, (s + d) - cand_new_s))
                 if cand_new_s > new_s + 1e-3:
                     new_s, new_d = cand_new_s, cand_new_d
                     print(f"[RESUME-STATE] applying resume: {int(s)}s -> {int(new_s)}s rem={new_d:.1f}s")
         except Exception:
             pass
+        # Final clamping and validation
+        if total_sec > 0:
+            # enforce bounds: s <= new_s <= (s+d) for normal, or <= total_sec for tail
+            upper = (float(s + d) if d > 0.0 else float(total_sec))
+            if new_s < s:
+                new_s = s
+            if new_s > upper:
+                new_s = upper
+            # recompute duration after clamp
+            new_d = (max(0.0, float(total_sec) - new_s) if (d == 0.0 and total_sec > 0) else max(0.0, (s + d) - new_s))
+            # skip if starting at/after end
+            if new_s >= float(total_sec) or new_d <= 0.0:
+                print(f"[RESUME-SKIP] {int(new_s)}s span={new_d:.2f}s (at/end-of-file) -> skip")
+                continue
         # Skip tiny remaining chunks if requested (avoid ~1-row RAW files)
         if new_d > 0.0 and new_d < float(args.min_chunk_sec):
             print(f"[RESUME-SKIP] {int(new_s)}s span={new_d:.2f}s < min-chunk-sec={args.min_chunk_sec} -> skip")
