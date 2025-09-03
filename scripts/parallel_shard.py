@@ -173,6 +173,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=0, help="cap total concurrent workers (0=auto)")
     ap.add_argument("--quiet", type=int, default=0, help="suppress noisy child init logs and compact progress (1=on)")
     ap.add_argument("--max-chunk-eta", type=int, default=8, help="max number of per-chunk ETA items to render in progress line")
+    ap.add_argument("--final-merge", type=int, default=0, help="perform final merged CSV/RAW outputs at end (1=yes,0=no; default 0)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -576,10 +577,14 @@ def main() -> None:
     
     # RAWファイル生成の設定確認
     if args.raw_output.strip():
-        print(f"[RAW] will generate per-chunk raw files and merge to: {args.raw_output}")
+        print(f"[RAW] per-chunk RAW files will be generated under: {work_dir}")
+        if int(args.final_merge) == 1:
+            print(f"[RAW] final merge destination: {args.raw_output}")
+        else:
+            print(f"[RAW] NOTE: final merge is disabled (--final-merge 0). You can merge RAW locally later.")
         if int(args.online_merge) == 0:
-            print(f"[RAW] INFO: --online-merge 0 detected. For RAW, using --merge-every-sec 0 (child flush interval≈1s)")
-            print(f"[RAW] DEBUG: Child will write raw CSV rows frequently for continuous monitoring")
+            print(f"[RAW] INFO: --online-merge 0 detected. Using --merge-every-sec 0 in children for frequent flushing (~1s)")
+            print(f"[RAW] DEBUG: Children will write RAW CSV rows continuously for monitoring")
         else:
             print(f"[RAW] INFO: Using --merge-every-sec 30 for online merging")
 
@@ -999,7 +1004,8 @@ def main() -> None:
                 if m:
                     perc = float(m.group(1)) / 100.0
                     with lock:
-                        progress_map[start_key] = max(0.0, min(1.0, perc))
+                        prev = progress_map.get(start_key, 0.0)
+                        progress_map[start_key] = max(prev, max(0.0, min(1.0, perc)))
                 
                 # RAWファイルの進捗も定期的にチェック（PROGRESSログの時のみ）
                 if args.raw_output.strip() and perc > 0.1:  # 10%以上進捗がある場合
@@ -1082,7 +1088,12 @@ def main() -> None:
             pass
 
     def _global_progress_printer() -> None:
-        # 数秒ごとに全体進捗（加重平均）を出力
+        # ETA基準（ウォームアップ補正）
+        eta_start_time = [None]
+        eta_start_done = [0.0]
+        completed_chunks_count = [0]
+        last_global_frac = [0.0]
+
         while True:
             time.sleep(2.0)
             with lock:
@@ -1107,28 +1118,28 @@ def main() -> None:
                         weight_sum += w
                     if weight_sum > 0:
                         frac = max(0.0, min(100.0, (done / weight_sum) * 100.0))
-                        elapsed = time.time() - t_main
-                        # 推定速度: elapsedで何秒分進んだか（動画秒）
-                        est_speed = (done / max(1e-6, elapsed))
-                        remain_video = max(0.0, float(total_sec) - (covered_total + (done if done < weight_sum else weight_sum)))
+                        # 単調増加を保証
+                        if frac < last_global_frac[0]:
+                            frac = last_global_frac[0]
+                        else:
+                            last_global_frac[0] = frac
+                        now_ts = time.time()
+                        elapsed = now_ts - t_main
+                        # ETA速度: ウォームアップ補正（一定時間 or 完了チャンク数で基準化）
+                        cur_total_done = covered_total + min(done, weight_sum)
+                        # ETA基準の確立条件
+                        if eta_start_time[0] is None:
+                            # 時間ベース or 完了チャンク数で基準確立
+                            if (elapsed >= max(10.0, float(args.warmup_sec))) or (len([v for v in progress_map.values() if v >= 0.999]) >= max(2, max(1, int(max_workers/2)))):
+                                eta_start_time[0] = now_ts
+                                eta_start_done[0] = cur_total_done
+                        if eta_start_time[0] is not None and now_ts > eta_start_time[0] + 1.0:
+                            est_speed = (cur_total_done - eta_start_done[0]) / max(1e-6, (now_ts - eta_start_time[0]))
+                        else:
+                            # 初期はフォールバック
+                            est_speed = cur_total_done / max(1e-6, elapsed)
+                        remain_video = max(0.0, float(total_sec) - cur_total_done)
                         remain_sec = remain_video / max(1e-6, est_speed)
-                        # per-chunk ETAs
-                        parts = []
-                        now = time.time()
-                        for (s, d, _) in chunks:
-                            w = (float(total_sec) - s) if (d == 0.0 and total_sec > 0) else float(d)
-                            w = max(0.0, w)
-                            p = progress_map.get(s, 0.0)
-                            st = start_wall_map.get(s, None)
-                            eta_c = None
-                            if st is not None and p > 0 and w > 0:
-                                elapsed_c = now - st
-                                speed_c = (w * p) / max(1e-6, elapsed_c)
-                                remain_c = (w * (1.0 - p)) / max(1e-6, speed_c)
-                                eta_c = remain_c
-                            if not bool(int(args.quiet)):
-                                parts.append(f"s={int(s)} {p*100:.1f}% ETA={eta_c/60:.1f}m" if eta_c is not None else f"s={int(s)} {p*100:.1f}%")
-                        # グローバル先頭行（チャンクは静か/短縮）
                         if bool(int(args.quiet)):
                             print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% ({done:.1f}s/{total_sec:.1f}s) elapsed={elapsed/60:.1f}m ETA={_format_eta(max(0.0, remain_sec))}")
                         else:
@@ -1393,93 +1404,94 @@ def main() -> None:
     except Exception as e:
         print(f"[RAW-MONITOR] Error stopping monitor thread: {e}")
 
-    # 連結（ヘッダは先頭のみ）かつ timestamp を動画全体の相対に正規化
-    final_out = os.path.join(out_dir, f"{base_name}_{video_id}_merged.csv")
-    with open(final_out, "w", newline="") as fo:
-        wrote_header = False
-        video_start_dt = parse_video_start_datetime(args.video)
-        # start_sec でソートして結合（オーバーラップによる重複を除外）
-        last_ts = None  # 重複除外用の前回タイムスタンプ
-        for (s, d, op) in sorted(chunks, key=lambda x: x[0]):
-            if not os.path.exists(op):
-                continue
-            with open(op, newline="") as fi:
-                header = fi.readline().rstrip("\n")
-                cols = header.split(",")
-                # 追加列 clock_time を追加（存在しない場合）
-                if not wrote_header:
-                    if "clock_time" not in cols:
-                        fo.write(header + ",clock_time\n")
-                    else:
-                        fo.write(header + "\n")
-                    wrote_header = True
-                # 正規化のため列位置を特定
-                try:
-                    idx_ts = cols.index("timestamp")
-                    idx_full = cols.index("ts_from_file_start")
-                except ValueError:
-                    idx_ts = -1
-                    idx_full = -1
-                for line in fi:
-                    row = line.rstrip("\n")
-                    parts = row.split(",")
-                    # replace timestamp with ts_from_file_start if both exist
-                    if (idx_ts >= 0 and idx_full >= 0) and len(parts) > max(idx_ts, idx_full):
-                        parts[idx_ts] = parts[idx_full]
-                    
-                    # オーバーラップによる重複除外（±100ms以内なら除外）
-                    current_ts = None
-                    try:
-                        if idx_full >= 0 and idx_full < len(parts):
-                            v = parts[idx_full]
-                            h, m, rest = v.split(":")
-                            if "." in rest:
-                                sec, ms = rest.split(".")
+    # 連結（ヘッダは先頭のみ）かつ timestamp を動画全体の相対に正規化（必要時のみ）
+    if int(args.final_merge) == 1:
+        final_out = os.path.join(out_dir, f"{base_name}_{video_id}_merged.csv")
+        with open(final_out, "w", newline="") as fo:
+            wrote_header = False
+            video_start_dt = parse_video_start_datetime(args.video)
+            # start_sec でソートして結合（オーバーラップによる重複を除外）
+            last_ts = None  # 重複除外用の前回タイムスタンプ
+            for (s, d, op) in sorted(chunks, key=lambda x: x[0]):
+                if not os.path.exists(op):
+                    continue
+                with open(op, newline="") as fi:
+                    header = fi.readline().rstrip("\n")
+                    cols = header.split(",")
+                    # 追加列 clock_time を追加（存在しない場合）
+                    if not wrote_header:
+                        if "clock_time" not in cols:
+                            fo.write(header + ",clock_time\n")
                         else:
-                            sec, ms = rest, "0"
-                            current_ts = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
-                    except Exception:
-                        pass
-                    
-                    # 重複除外チェック
-                    if current_ts is not None and last_ts is not None:
-                        if abs(current_ts - last_ts) < 0.1:  # ±100ms以内
-                            continue  # 重複行をスキップ
-                    
-                    # compute clock_time from ts_from_file_start
-                    clock_str = ""
+                            fo.write(header + "\n")
+                        wrote_header = True
+                    # 正規化のため列位置を特定
                     try:
-                        base_s = None
-                        if idx_full >= 0 and idx_full < len(parts):
-                            # expected HH:MM:SS.mmm
-                            v = parts[idx_full]
-                            # parse to seconds
-                            h, m, rest = v.split(":")
-                            if "." in rest:
-                                sec, ms = rest.split(".")
-                        else:
-                            sec, ms = rest, "0"
-                            base_s = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
-                        if base_s is not None and video_start_dt is not None:
-                            dt = video_start_dt + timedelta(seconds=float(base_s))
-                            clock_str = dt.strftime("%H:%M:%S.%f")[:-3]
-                        elif base_s is not None:
-                            clock_str = hhmmss_ms(base_s)
-                    except Exception:
+                        idx_ts = cols.index("timestamp")
+                        idx_full = cols.index("ts_from_file_start")
+                    except ValueError:
+                        idx_ts = -1
+                        idx_full = -1
+                    for line in fi:
+                        row = line.rstrip("\n")
+                        parts = row.split(",")
+                        # replace timestamp with ts_from_file_start if both exist
+                        if (idx_ts >= 0 and idx_full >= 0) and len(parts) > max(idx_ts, idx_full):
+                            parts[idx_ts] = parts[idx_full]
+                        
+                        # オーバーラップによる重複除外（±100ms以内なら除外）
+                        current_ts = None
+                        try:
+                            if idx_full >= 0 and idx_full < len(parts):
+                                v = parts[idx_full]
+                                h, m, rest = v.split(":")
+                                if "." in rest:
+                                    sec, ms = rest.split(".")
+                            else:
+                                sec, ms = rest, "0"
+                                current_ts = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
+                        except Exception:
+                            pass
+                        
+                        # 重複除外チェック
+                        if current_ts is not None and last_ts is not None:
+                            if abs(current_ts - last_ts) < 0.1:  # ±100ms以内
+                                continue  # 重複行をスキップ
+                        
+                        # compute clock_time from ts_from_file_start
                         clock_str = ""
-                    
-                    # append clock_time if header did not include it
-                    if "clock_time" not in cols:
-                        parts_out = ",".join(parts + [clock_str])
-                    else:
-                        # if file already had clock_time, keep row as is
-                        parts_out = ",".join(parts)
-                    
-                    fo.write(parts_out + "\n")
-                    
-                    # 重複除外用のタイムスタンプ更新
-                    if current_ts is not None:
-                        last_ts = current_ts
+                        try:
+                            base_s = None
+                            if idx_full >= 0 and idx_full < len(parts):
+                                # expected HH:MM:SS.mmm
+                                v = parts[idx_full]
+                                # parse to seconds
+                                h, m, rest = v.split(":")
+                                if "." in rest:
+                                    sec, ms = rest.split(".")
+                            else:
+                                sec, ms = rest, "0"
+                                base_s = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
+                            if base_s is not None and video_start_dt is not None:
+                                dt = video_start_dt + timedelta(seconds=float(base_s))
+                                clock_str = dt.strftime("%H:%M:%S.%f")[:-3]
+                            elif base_s is not None:
+                                clock_str = hhmmss_ms(base_s)
+                        except Exception:
+                            clock_str = ""
+                        
+                        # append clock_time if header did not include it
+                        if "clock_time" not in cols:
+                            parts_out = ",".join(parts + [clock_str])
+                        else:
+                            # if file already had clock_time, keep row as is
+                            parts_out = ",".join(parts)
+                        
+                        fo.write(parts_out + "\n")
+                        
+                        # 重複除外用のタイムスタンプ更新
+                        if current_ts is not None:
+                            last_ts = current_ts
     print(f"[PARALLEL] merged -> {final_out}")
 
     # Coverage verification for merged final CSV
@@ -1522,7 +1534,7 @@ def main() -> None:
         except Exception:
             return None, None
 
-    if int(args.verify_coverage) == 1 and total_sec > 0:
+    if int(args.final_merge) == 1 and int(args.verify_coverage) == 1 and total_sec > 0:
         min_s, max_s = _compute_coverage(final_out)
         if min_s is not None and max_s is not None:
             covered = max(0.0, float(max_s) - float(min_s))
@@ -1545,71 +1557,75 @@ def main() -> None:
 
     # RAWの結合（ユーザーが要求した場合）
     if args.raw_output.strip():
-        raw_final = args.raw_output.strip()
-        raw_dir = os.path.dirname(raw_final)
-        if raw_dir:
-            os.makedirs(raw_dir, exist_ok=True)
-        
-        # RAWファイルの状況をチェック
-        empty_files = []
-        total_size = 0
-        for (s, d, _) in sorted(chunks, key=lambda x: x[0]):
-            rp = raw_by_start.get(int(s))
-            if rp and os.path.exists(rp):
-                size = os.path.getsize(rp)
-                total_size += size
-                if size < 1000:  # 1KB未満は空とみなす
-                    empty_files.append((s, d, rp, size))
-        
-        if empty_files:
-            print(f"[RAW-WARN] {len(empty_files)} raw files are suspiciously small:")
-            for s, d, rp, size in empty_files[:5]:  # 最初の5個のみ表示
-                print(f"[RAW-WARN]   {os.path.basename(rp)}: {size} bytes (start={s}s, dur={d}s)")
-            if len(empty_files) > 5:
-                print(f"[RAW-WARN]   ... and {len(empty_files) - 5} more")
-            print(f"[RAW-WARN] Total raw files size: {total_size} bytes")
-            if int(args.online_merge) == 0:
-                print(f"[RAW-WARN] This may indicate --no-merge is preventing proper raw file generation")
-                print(f"[RAW-WARN] Check [CMD-DEBUG] logs above to verify merge flags are correct")
-            else:
-                print(f"[RAW-WARN] This may indicate a processing issue in child processes")
-        
-        with open(raw_final, "w", newline="") as fo:
-            wrote_header_raw = False
+        # RAWの最終マージ（必要時のみ）
+        if int(args.final_merge) == 1:
+            raw_final = args.raw_output.strip()
+            raw_dir = os.path.dirname(raw_final)
+            if raw_dir:
+                os.makedirs(raw_dir, exist_ok=True)
+            
+            # RAWファイルの状況をチェック
+            empty_files = []
+            total_size = 0
             for (s, d, _) in sorted(chunks, key=lambda x: x[0]):
                 rp = raw_by_start.get(int(s))
-                if not rp or not os.path.exists(rp):
-                    continue
-                with open(rp, newline="") as fi:
-                    header = fi.readline().rstrip("\n")
-                    if not wrote_header_raw:
-                        fo.write(header + "\n")
-                        wrote_header_raw = True
-                    for line in fi:
-                        fo.write(line)
-        print(f"[PARALLEL] raw merged -> {raw_final}")
-
-        # Coverage verification for raw merged as well
-        if int(args.verify_coverage) == 1 and total_sec > 0:
-            min_s, max_s = _compute_coverage(raw_final)
-            if min_s is not None and max_s is not None:
-                covered = max(0.0, float(max_s) - float(min_s))
-                try:
-                    vstart = parse_video_start_datetime(args.video)
-                    if vstart is not None:
-                        from datetime import timedelta as _td
-                        start_clock = (vstart + _td(seconds=float(min_s))).strftime("%H:%M:%S")
-                        end_clock = (vstart + _td(seconds=float(max_s))).strftime("%H:%M:%S")
-                    else:
+                if rp and os.path.exists(rp):
+                    size = os.path.getsize(rp)
+                    total_size += size
+                    if size < 1000:  # 1KB未満は空とみなす
+                        empty_files.append((s, d, rp, size))
+            
+            if empty_files:
+                print(f"[RAW-WARN] {len(empty_files)} raw files are suspiciously small:")
+                for s, d, rp, size in empty_files[:5]:  # 最初の5個のみ表示
+                    print(f"[RAW-WARN]   {os.path.basename(rp)}: {size} bytes (start={s}s, dur={d}s)")
+                if len(empty_files) > 5:
+                    print(f"[RAW-WARN]   ... and {len(empty_files) - 5} more")
+                print(f"[RAW-WARN] Total raw files size: {total_size} bytes")
+                if int(args.online_merge) == 0:
+                    print(f"[RAW-WARN] This may indicate --no-merge is preventing proper raw file generation")
+                    print(f"[RAW-WARN] Check [CMD-DEBUG] logs above to verify merge flags are correct")
+                else:
+                    print(f"[RAW-WARN] This may indicate a processing issue in child processes")
+            
+            with open(raw_final, "w", newline="") as fo:
+                wrote_header_raw = False
+                for (s, d, _) in sorted(chunks, key=lambda x: x[0]):
+                    rp = raw_by_start.get(int(s))
+                    if not rp or not os.path.exists(rp):
+                        continue
+                    with open(rp, newline="") as fi:
+                        header = fi.readline().rstrip("\n")
+                        if not wrote_header_raw:
+                            fo.write(header + "\n")
+                            wrote_header_raw = True
+                        for line in fi:
+                            fo.write(line)
+            print(f"[PARALLEL] raw merged -> {raw_final}")
+            
+            # Coverage verification for raw merged as well
+            if int(args.verify_coverage) == 1 and total_sec > 0:
+                min_s, max_s = _compute_coverage(raw_final)
+                if min_s is not None and max_s is not None:
+                    covered = max(0.0, float(max_s) - float(min_s))
+                    try:
+                        vstart = parse_video_start_datetime(args.video)
+                        if vstart is not None:
+                            from datetime import timedelta as _td
+                            start_clock = (vstart + _td(seconds=float(min_s))).strftime("%H:%M:%S")
+                            end_clock = (vstart + _td(seconds=float(max_s))).strftime("%H:%M:%S")
+                        else:
+                            start_clock = end_clock = ""
+                    except Exception:
                         start_clock = end_clock = ""
-                except Exception:
-                    start_clock = end_clock = ""
-                print(f"[COVERAGE-RAW] {os.path.basename(raw_final)}: start={min_s:.3f}s end={max_s:.3f}s span={covered:.1f}s (~{covered/60:.1f}m) start_clock={start_clock} end_clock={end_clock}")
-                missing = max(0.0, float(total_sec) - covered)
-                if missing > float(total_sec) * 0.05:
-                    print(f"[WARN] raw coverage below expected: total_video~{total_sec:.1f}s, missing~{missing:.1f}s")
-            else:
-                print("[WARN] could not compute coverage from raw merged CSV")
+                    print(f"[COVERAGE-RAW] {os.path.basename(raw_final)}: start={min_s:.3f}s end={max_s:.3f}s span={covered:.1f}s (~{covered/60:.1f}m) start_clock={start_clock} end_clock={end_clock}")
+                    missing = max(0.0, float(total_sec) - covered)
+                    if missing > float(total_sec) * 0.05:
+                        print(f"[WARN] raw coverage below expected: total_video~{total_sec:.1f}s, missing~{missing:.1f}s")
+                else:
+                    print("[WARN] could not compute coverage from raw merged CSV")
+        else:
+            print("[PARALLEL] final merge disabled; per-chunk RAW files are available in work_dir.")
 
 
 if __name__ == "__main__":
