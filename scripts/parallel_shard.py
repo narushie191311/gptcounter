@@ -737,6 +737,11 @@ def main() -> None:
                 rng = None
             if rng:
                 first_s, last_s = rng
+                try:
+                    if first_s is not None and last_s is not None:
+                        print(f"[RESUME-SRC] chunk {int(s)}s file='{op}' span={first_s:.3f}..{last_s:.3f}")
+                except Exception:
+                    pass
                 # last_s is absolute (ts_from_file_start), same scale as s
                 if last_s is not None and last_s > s + 1.0:
                     # Adjust start to last_s, recompute duration
@@ -757,6 +762,10 @@ def main() -> None:
             except Exception:
                 st = None
             if st is not None and st > s + 1.0:
+                try:
+                    print(f"[RESUME-SRC] chunk {int(s)}s state='{resume_state_path}' position={float(st):.3f}s")
+                except Exception:
+                    pass
                 cand_new_s = float(st)
                 # clamp resume point into this chunk span (or to total length if tail)
                 if total_sec > 0:
@@ -1621,6 +1630,31 @@ def main() -> None:
                 print("[WARN] could not compute coverage from raw merged CSV")
     elif args.raw_output.strip() and int(args.final_merge) == 0:
         print("[RAW] final merge disabled (--final-merge 0). Skipping RAW merge.")
+
+    # 最終出力の場所をまとめて表示
+    try:
+        print(f"[OUTPUT] work_dir: {work_dir}")
+        if int(args.final_merge) == 1:
+            try:
+                print(f"[OUTPUT] merged CSV: {final_out}")
+            except Exception:
+                pass
+            if args.raw_output.strip():
+                try:
+                    print(f"[OUTPUT] merged RAW: {args.raw_output.strip()}")
+                except Exception:
+                    pass
+        else:
+            print(f"[OUTPUT] chunk CSV pattern: {os.path.join(work_dir, base_name + '_chunk_*s.csv')}")
+            if args.raw_output.strip():
+                print(f"[OUTPUT] RAW chunk pattern: {os.path.join(work_dir, base_name + '_raw_chunk_*s.csv')}")
+        # レジューム状態ファイルの場所
+        try:
+            print(f"[OUTPUT] resume state: {resume_state_path}")
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
