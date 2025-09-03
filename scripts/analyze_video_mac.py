@@ -213,6 +213,7 @@ def main():
     flush_interval = max(1.0, float(args.merge_every_sec))  # 互換フラグをフラッシュ間隔に活用
     processed_frames = 0
     emitted_rows = 0
+    emitted_rows_raw = 0
 
     # 推定終了フレーム（総尺がわかる場合）
     if math.isfinite(end_time_sec):
@@ -224,6 +225,7 @@ def main():
     # メインループ
     frame_idx = start_frame_idx
     ok, frame = cap.read()
+    pos_sec_file = args.start_sec
     while ok:
         # 現在の再生時刻（ファイル基準）
         pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC) or (frame_idx * 1000.0 / max(1e-6, fps))
@@ -250,6 +252,8 @@ def main():
                 if f_raw:
                     f_raw.write("\n".join(lines) + "\n")
                 emitted_rows += len(lines)
+                if f_raw:
+                    emitted_rows_raw += len(lines)
 
         processed_frames += 1
 
@@ -272,6 +276,11 @@ def main():
                     f_raw.flush(); os.fsync(f_raw.fileno())
             except Exception:
                 pass
+            # 継続ログ: CSV/RAW の現在行数と時刻
+            try:
+                print(f"{now_prefix(pos_sec_file)} [FLUSH] csv_rows={emitted_rows} raw_rows={(emitted_rows_raw if f_raw else emitted_rows)} time={ts_hhmmss_ms(pos_sec_file)}")
+            except Exception:
+                pass
             last_flush = now
 
         # 次へ
@@ -285,6 +294,11 @@ def main():
             f_raw.flush(); os.fsync(f_raw.fileno())
     except Exception:
         pass
+    try:
+        # 最終ログ
+        print(f"{now_prefix(pos_sec_file)} [FLUSH-END] csv_rows={emitted_rows} raw_rows={(emitted_rows_raw if f_raw else emitted_rows)}")
+    except Exception:
+        pass
     f_csv.close()
     if f_raw: f_raw.close()
     try:
@@ -292,7 +306,7 @@ def main():
     except Exception:
         pass
 
-    end_pos_sec = min(end_time_sec, pos_sec_file if math.isfinite(pos_sec_file) else (args.start_sec + args.duration_sec))
+    end_pos_sec = min(end_time_sec, pos_sec_file if (isinstance(pos_sec_file, (int,float)) and math.isfinite(pos_sec_file)) else (args.start_sec + args.duration_sec))
     # 完了通知（親は global_end_sec を拾う）
     print(f"[CHUNK_COMPLETED] start_sec={args.start_sec:.3f} global_start_sec={args.global_start_sec:.3f} global_end_sec={end_pos_sec:.3f} rows={emitted_rows}")
 

@@ -160,12 +160,12 @@ def main() -> None:
     ap.add_argument("--gpus", default="", help="comma-separated GPU ids for multi-GPU (e.g., 0,1)")
     ap.add_argument("--procs-per-gpu", type=int, default=1, help="parallel processes per GPU")
     ap.add_argument("--skip-existing", type=int, default=1, help="skip chunks already written (1=yes,0=no)")
-    ap.add_argument("--online-merge", type=int, default=0, help="enable analyzer online merge (1) or disable (0)")
+    ap.add_argument("--online-merge", type=int, default=1, help="enable analyzer online merge (1) or disable (0)")
     ap.add_argument("--retries", type=int, default=0, help="retry count per chunk on non-zero exit")
     ap.add_argument("--raw-output", default="", help="final merged RAW (non-merged-by-IDs) CSV path. If set, per-chunk raw files are auto-generated and merged here")
     ap.add_argument("--per-chunk-timeout-sec", type=float, default=0.0, help="kill a chunk if it exceeds this wall time (0=disable)")
     ap.add_argument("--prewarm-sec", type=float, default=2.0, help="run a short single analyzer to pre-download models (0=disable)")
-    ap.add_argument("--auto-tune", type=int, default=1, help="auto tune workers from GPU VRAM and host RAM (1=on)")
+    ap.add_argument("--auto-tune", type=int, default=0, help="auto tune workers from GPU VRAM and host RAM (1=on)")
     ap.add_argument("--gpu-monitor-sec", type=float, default=20.0, help="print GPU usage every N seconds (0=off)")
     ap.add_argument("--host-mem-per-proc-gb", type=float, default=2.0, help="estimated host RAM required per process (GB)")
     ap.add_argument("--verify-coverage", type=int, default=1, help="verify merged coverage against video length and print summary (1=on)")
@@ -173,72 +173,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=0, help="cap total concurrent workers (0=auto)")
     ap.add_argument("--quiet", type=int, default=0, help="suppress noisy child init logs and compact progress (1=on)")
     ap.add_argument("--max-chunk-eta", type=int, default=8, help="max number of per-chunk ETA items to render in progress line")
-    ap.add_argument("--final-merge", type=int, default=0, help="perform final CSV/RAW merging at the end (1=yes, 0=no)")
-    ap.add_argument("--min-chunk-sec", type=float, default=1.0, help="skip tiny remaining resume spans under this seconds (avoid 1-row RAW)")
     args = ap.parse_args()
-
-    # Initialize auto-quality defaults to avoid UnboundLocalError
-    auto_yolo = None
-    auto_det = None
-    auto_dn = None
-
-    # filter extra-args for analyzer compatibility (available everywhere)
-    def _filter_extra(extra: str, allow_merge_flags: bool) -> list:
-        try:
-            import shlex
-            tokens = shlex.split(extra.strip()) if extra.strip() else []
-        except Exception:
-            tokens = extra.strip().split() if extra.strip() else []
-        if not tokens:
-            return []
-        # allow-list of child analyzer flags
-        allow = {
-            "--device", "--merge-every-sec", "--no-merge", "--output-csv-raw",
-            "--detect-every-n", "--det-size", "--yolo-weights", "--no-show"
-        }
-        needs_val = {"--device", "--merge-every-sec", "--output-csv-raw", "--detect-every-n", "--det-size", "--yolo-weights"}
-        out = []
-        i = 0
-        while i < len(tokens):
-            t = tokens[i]
-            if any(t.startswith(f+"=") for f in allow):
-                # keep --flag=value forms
-                # exclude merge flags when not allowed
-                if not allow_merge_flags and (t.startswith("--merge-every-sec") or t.startswith("--no-merge")):
-                    i += 1
-                    continue
-                # always exclude online-merge (parent controls it)
-                if t.startswith("--online-merge"):
-                    i += 1
-                    continue
-                out.append(t)
-                i += 1
-                continue
-            if t in allow:
-                if (not allow_merge_flags) and (t in {"--merge-every-sec", "--no-merge"}):
-                    i += 1
-                    # skip optional value for --merge-every-sec
-                    if t == "--merge-every-sec" and i < len(tokens):
-                        # skip its value
-                        i += 1
-                    continue
-                if t == "--online-merge":
-                    i += 1
-                    # skip possible value
-                    if i < len(tokens) and not tokens[i].startswith("--"):
-                        i += 1
-                    continue
-                out.append(t)
-                i += 1
-                if t in needs_val and i < len(tokens) and not tokens[i].startswith("--"):
-                    out.append(tokens[i])
-                    i += 1
-                continue
-            # drop unknown flag and its value if present
-            i += 1
-            if i < len(tokens) and not tokens[i].startswith("--"):
-                i += 1
-        return out
 
     cap = cv2.VideoCapture(args.video)
     fps = 30.0
@@ -327,69 +262,8 @@ def main() -> None:
         if int(args.online_merge) == 0:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
             print(f"[WARMUP] RAW mode: --no-merge enabled for raw feature extraction")
-        # filter extra-args for analyzer compatibility
-        def _filter_extra(extra: str, allow_merge_flags: bool) -> list:
-            try:
-                import shlex
-                tokens = shlex.split(extra.strip()) if extra.strip() else []
-            except Exception:
-                tokens = extra.strip().split() if extra.strip() else []
-            if not tokens:
-                return []
-            # allow-list of child analyzer flags
-            allow = {
-                "--device", "--merge-every-sec", "--no-merge", "--output-csv-raw",
-                "--detect-every-n", "--det-size", "--yolo-weights", "--no-show"
-            }
-            needs_val = {"--device", "--merge-every-sec", "--output-csv-raw", "--detect-every-n", "--det-size", "--yolo-weights"}
-            out = []
-            i = 0
-            while i < len(tokens):
-                t = tokens[i]
-                if any(t.startswith(f+"=") for f in allow):
-                    # keep --flag=value forms
-                    # exclude merge flags when not allowed
-                    if not allow_merge_flags and (t.startswith("--merge-every-sec") or t.startswith("--no-merge")):
-                        i += 1
-                        continue
-                    # always exclude online-merge (parent controls it)
-                    if t.startswith("--online-merge"):
-                        i += 1
-                        continue
-                    out.append(t)
-                    i += 1
-                    continue
-                if t in allow:
-                    if (not allow_merge_flags) and (t in {"--merge-every-sec", "--no-merge"}):
-                        i += 1
-                        # skip optional value for --merge-every-sec
-                        if t == "--merge-every-sec" and i < len(tokens):
-                            # skip its value
-                            i += 1
-                        continue
-                    if t == "--online-merge":
-                        i += 1
-                        # skip possible value
-                        if i < len(tokens) and not tokens[i].startswith("--"):
-                            i += 1
-                        continue
-                    out.append(t)
-                    i += 1
-                    if t in needs_val and i < len(tokens) and not tokens[i].startswith("--"):
-                        out.append(tokens[i])
-                        i += 1
-                    continue
-                # drop unknown flag and its value if present
-                i += 1
-                if i < len(tokens) and not tokens[i].startswith("--"):
-                    i += 1
-            return out
-
         if args.extra_args.strip():
-            filtered = _filter_extra(args.extra_args, allow_merge_flags=(int(args.online_merge) != 0))
-            if filtered:
-                print(f"[WARMUP-FILTER] extra applied: {' '.join(filtered)}")
-            cmd += filtered
+            cmd += args.extra_args.strip().split()
         print(f"[WARMUP] measuring throughput for {sample_sec:.1f}s on device={warmup_device} ...")
         t0 = time.time()
         run_rc = run_proc_streaming(cmd, cwd=project_root, per_chunk_timeout_sec=max(30.0, sample_sec * 10), suppress_init=bool(int(args.quiet)))
@@ -445,10 +319,7 @@ def main() -> None:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
             print(f"[PREWARM] RAW mode: --no-merge enabled for raw feature extraction")
         if args.extra_args.strip():
-            filtered = _filter_extra(args.extra_args, allow_merge_flags=(int(args.online_merge) != 0))
-            if filtered:
-                print(f"[PREWARM-FILTER] extra applied: {' '.join(filtered)}")
-            cmd += filtered
+            cmd += args.extra_args.strip().split()
         print("[PREWARM] starting a short run to pre-download models and warm caches...")
         _ = run_proc_streaming(cmd, cwd=project_root, per_chunk_timeout_sec=max(60.0, float(args.prewarm_sec) * 20), suppress_init=bool(int(args.quiet)))
         try:
@@ -764,19 +635,8 @@ def main() -> None:
                     print(f"[RESUME-STATE] applying resume: {int(s)}s -> {int(new_s)}s rem={new_d:.1f}s")
         except Exception:
             pass
-        # Skip tiny remaining chunks if requested (avoid ~1-row RAW files)
-        if new_d > 0.0 and new_d < float(args.min_chunk_sec):
-            print(f"[RESUME-SKIP] {int(new_s)}s span={new_d:.2f}s < min-chunk-sec={args.min_chunk_sec} -> skip")
-            continue
         adjusted.append((new_s, new_d, op))
     chunks = adjusted
-    # レジュームで開始時刻が変わった場合、raw_by_startを再生成（開始時刻に追随するファイル名を割当）
-    if args.raw_output.strip():
-        new_raw_by_start: Dict[int, str] = {}
-        for s, d, _ in chunks:
-            raw_name = os.path.join(work_dir, f"{base_name}_raw_chunk_{int(s)}s.csv")
-            new_raw_by_start[int(s)] = raw_name
-        raw_by_start = new_raw_by_start
     rcodes = []
     def make_cmd(start_s: float, dur_s: float, out_csv: str, gpu_env: Optional[str], raw_csv: Optional[str], auto_yolo: Optional[str] = None, auto_det: Optional[str] = None, auto_dn: Optional[int] = None) -> Tuple[List[str], Optional[dict]]:
         # Auto device selection when user didn't specify in extra-args
@@ -859,15 +719,38 @@ def main() -> None:
             cmd += ["--detect-every-n", str(auto_dn)]
             print(f"[CMD-AUTO] chunk {start_s}s: injected --detect-every-n {auto_dn}")
         
-        # フィルタリングされたextra-argsを追加（未知フラグ除去 + 必要に応じてマージ関連除去）
+        # フィルタリングされたextra-argsを追加（online_merge=0 の場合のみマージ関連のフラグを除外）
         if extra:
             try:
-                filtered = _filter_extra(extra, allow_merge_flags=(int(args.online_merge) != 0))
+                import shlex
+                tokens = shlex.split(extra)
             except Exception:
-                filtered = []
-            if filtered:
-                print(f"[CMD-FILTER] remaining extra args: {' '.join(filtered)}")
-            cmd += filtered
+                tokens = extra.split()
+            filtered_extra = []
+            filtered_out = []
+            if int(args.online_merge) == 0:
+                i = 0
+                while i < len(tokens):
+                    token = tokens[i]
+                    # マージ関連のフラグをスキップ
+                    if token in ["--no-merge", "--merge-every-sec", "--online-merge"]:
+                        filtered_out.append(token)
+                        i += 1
+                        # 値付きの --merge-every-sec を丸ごと外す
+                        if token == "--merge-every-sec" and i < len(tokens):
+                            filtered_out.append(tokens[i])
+                            i += 1
+                        continue
+                    filtered_extra.append(token)
+                    i += 1
+                if filtered_out:
+                    print(f"[CMD-FILTER] filtered out merge flags: {' '.join(filtered_out)}")
+                if filtered_extra:
+                    print(f"[CMD-FILTER] remaining extra args: {' '.join(filtered_extra)}")
+                cmd += filtered_extra
+            else:
+                # online-merge が有効な場合は extra-args をそのまま適用
+                cmd += tokens
         
         # デバッグ用：最終的なコマンドを表示（マージ関連のフラグが正しく処理されているか確認）
         merge_flags = [flag for flag in cmd if flag in ["--no-merge", "--merge-every-sec"]]
@@ -893,6 +776,7 @@ def main() -> None:
             env = os.environ.copy()
         # safety envs to avoid TRT/CUDA provider conflicts and reduce spam
         env.setdefault("PYTHONUNBUFFERED", "1")
+        env.setdefault("PYTHONNOUSERSITE", "1")  # avoid mixing user-site pkgs (ABI mismatch)
         # MPSで未実装opが出た場合にCPUフォールバックを許可
         env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         # TensorRTとCUDA関連の環境変数を強化して初期化エラーを防止
@@ -1066,7 +950,6 @@ def main() -> None:
 
     def _global_progress_printer() -> None:
         # 数秒ごとに全体進捗（加重平均）を出力
-        last_global_frac = [0.0]
         while True:
             time.sleep(2.0)
             with lock:
@@ -1091,20 +974,11 @@ def main() -> None:
                         weight_sum += w
                     if weight_sum > 0:
                         frac = max(0.0, min(100.0, (done / weight_sum) * 100.0))
-                        # enforce monotonic global fraction
-                        if frac < last_global_frac[0]:
-                            frac = last_global_frac[0]
-                        else:
-                            last_global_frac[0] = frac
                         elapsed = time.time() - t_main
                         # 推定速度: elapsedで何秒分進んだか（動画秒）
                         est_speed = (done / max(1e-6, elapsed))
                         remain_video = max(0.0, float(total_sec) - (covered_total + (done if done < weight_sum else weight_sum)))
                         remain_sec = remain_video / max(1e-6, est_speed)
-                        eta_str = f"ETA={_format_eta(max(0.0, remain_sec))}"
-                        # warmup ETA correction: avoid early noisy ETA
-                        if elapsed < float(args.warmup_sec):
-                            eta_str = "ETA=warming"
                         # per-chunk ETAs
                         parts = []
                         now = time.time()
@@ -1123,11 +997,11 @@ def main() -> None:
                                 parts.append(f"s={int(s)} {p*100:.1f}% ETA={eta_c/60:.1f}m" if eta_c is not None else f"s={int(s)} {p*100:.1f}%")
                         # グローバル先頭行（チャンクは静か/短縮）
                         if bool(int(args.quiet)):
-                            print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% ({done:.1f}s/{total_sec:.1f}s) elapsed={elapsed/60:.1f}m {eta_str}")
+                            print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% ({done:.1f}s/{total_sec:.1f}s) elapsed={elapsed/60:.1f}m ETA={_format_eta(max(0.0, remain_sec))}")
                         else:
                             max_items = max(0, int(args.max_chunk_eta))
                             head = parts[:max_items]
-                            print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% ({done:.1f}s/{total_sec:.1f}s) elapsed={elapsed/60:.1f}m {eta_str} | { ' | '.join(head)}{' ...' if len(parts)>max_items else ''}")
+                            print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% ({done:.1f}s/{total_sec:.1f}s) elapsed={elapsed/60:.1f}m ETA={_format_eta(max(0.0, remain_sec))} | { ' | '.join(head)}{' ...' if len(parts)>max_items else ''}")
                         # persist progress jsonl
                         try:
                             prog = {
@@ -1188,19 +1062,19 @@ def main() -> None:
             gpu_env = None
             if gpu_ids:
                 gpu_env = gpu_ids[i % len(gpu_ids)]
-            # RAWファイル出力先（GPU有無に関わらず設定）
-            raw_op = None
-            if args.raw_output.strip():
-                raw_op = raw_by_start.get(int(s))
-                print(f"[RAW-DEBUG] chunk {s}s: raw_output='{args.raw_output}', start_sec={int(s)}, raw_op='{raw_op}'")
-            else:
-                print(f"[RAW-DEBUG] chunk {s}s: raw_output is empty, raw_op=None")
-            cmd, env = make_cmd(s, d, op, gpu_env, raw_op, auto_yolo, auto_det, auto_dn)
-            dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
-            print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
-            prefix = f"[CHUNK s={int(s)} dur={dur_str}] "
-            # wrap with retries
-            def worker(c=cmd, e=env, pref=prefix, start_sec=s, dur=d, out_path=op):
+                raw_op = None
+                if args.raw_output.strip():
+                    # use start_sec to look up raw file path
+                    raw_op = raw_by_start.get(int(s))
+                    print(f"[RAW-DEBUG] chunk {s}s: raw_output='{args.raw_output}', start_sec={int(s)}, raw_op='{raw_op}'")
+                else:
+                    print(f"[RAW-DEBUG] chunk {s}s: raw_output is empty, raw_op=None")
+                cmd, env = make_cmd(s, d, op, gpu_env, raw_op, auto_yolo, auto_det, auto_dn)
+                dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
+                print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
+                prefix = f"[CHUNK s={int(s)} dur={dur_str}] "
+                # wrap with retries
+                def worker(c=cmd, e=env, pref=prefix, start_sec=s, dur=d, out_path=op):
                     def _cb(line: str, key=start_sec):
                         _parse_child_progress(line, key)
                     # 登録（初期値0.0）とディスパッチ時刻/期待スパン
@@ -1248,11 +1122,11 @@ def main() -> None:
                             start_wall_map[start_sec] = time.time()
                         rc = run_proc_streaming(c2, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)))
                     return (rc, start_sec, dur, out_path)
-            futs.append(ex.submit(worker))
+                futs.append(ex.submit(worker))
         for fut in as_completed(futs):
-            rc, start_sec_done, dur_done, out_csv_path = fut.result()
-            rcodes.append(rc)
-            if rc == 0 and total_sec > 0:
+                rc, start_sec_done, dur_done, out_csv_path = fut.result()
+                rcodes.append(rc)
+                if rc == 0 and total_sec > 0:
                     # 実際に処理できた終了時刻をCSVから取得（信頼性向上）
                     actual_last = None
                     elapsed_wall = None
@@ -1386,89 +1260,94 @@ def main() -> None:
     except Exception as e:
         print(f"[RAW-MONITOR] Error stopping monitor thread: {e}")
 
-    # 最終マージ（デフォルト無効）。ユーザーが有効化した場合のみ実行
-    if int(args.final_merge) == 1:
-        final_out = os.path.join(out_dir, f"{base_name}_{video_id}_merged.csv")
-        with open(final_out, "w", newline="") as fo:
-            wrote_header = False
-            video_start_dt = parse_video_start_datetime(args.video)
-            # start_sec でソートして結合（オーバーラップによる重複を除外）
-            last_ts = None  # 重複除外用の前回タイムスタンプ
-            for (s, d, op) in sorted(chunks, key=lambda x: x[0]):
-                if not os.path.exists(op):
-                    continue
-                with open(op, newline="") as fi:
-                    header = fi.readline().rstrip("\n")
-                    cols = header.split(",")
-                    # 追加列 clock_time を追加（存在しない場合）
-                    if not wrote_header:
-                        if "clock_time" not in cols:
-                            fo.write(header + ",clock_time\n")
-                        else:
-                            fo.write(header + "\n")
-                        wrote_header = True
-                    # 正規化のため列位置を特定
+    # 連結（ヘッダは先頭のみ）かつ timestamp を動画全体の相対に正規化
+    final_out = os.path.join(out_dir, f"{base_name}_{video_id}_merged.csv")
+    with open(final_out, "w", newline="") as fo:
+        wrote_header = False
+        video_start_dt = parse_video_start_datetime(args.video)
+        # start_sec でソートして結合（オーバーラップによる重複を除外）
+        last_ts = None  # 重複除外用の前回タイムスタンプ
+        for (s, d, op) in sorted(chunks, key=lambda x: x[0]):
+            if not os.path.exists(op):
+                continue
+            with open(op, newline="") as fi:
+                header = fi.readline().rstrip("\n")
+                cols = header.split(",")
+                # 追加列 clock_time を追加（存在しない場合）
+                if not wrote_header:
+                    if "clock_time" not in cols:
+                        fo.write(header + ",clock_time\n")
+                    else:
+                        fo.write(header + "\n")
+                    wrote_header = True
+                # 正規化のため列位置を特定
+                try:
+                    idx_ts = cols.index("timestamp")
+                    idx_full = cols.index("ts_from_file_start")
+                except ValueError:
+                    idx_ts = -1
+                    idx_full = -1
+                for line in fi:
+                    row = line.rstrip("\n")
+                    parts = row.split(",")
+                    # replace timestamp with ts_from_file_start if both exist
+                    if (idx_ts >= 0 and idx_full >= 0) and len(parts) > max(idx_ts, idx_full):
+                        parts[idx_ts] = parts[idx_full]
+                    
+                    # オーバーラップによる重複除外（±100ms以内なら除外）
+                    current_ts = None
                     try:
-                        idx_ts = cols.index("timestamp")
-                        idx_full = cols.index("ts_from_file_start")
-                    except ValueError:
-                        idx_ts = -1
-                        idx_full = -1
-                    for line in fi:
-                        row = line.rstrip("\n")
-                        parts = row.split(",")
-                        # replace timestamp with ts_from_file_start if both exist
-                        if (idx_ts >= 0 and idx_full >= 0) and len(parts) > max(idx_ts, idx_full):
-                            parts[idx_ts] = parts[idx_full]
-                        # オーバーラップによる重複除外（±100ms以内なら除外）
-                        current_ts = None
-                        try:
-                            if idx_full >= 0 and idx_full < len(parts):
-                                v = parts[idx_full]
-                                h, m, rest = v.split(":")
-                                if "." in rest:
-                                    sec, ms = rest.split(".")
-                                else:
-                                    sec, ms = rest, "0"
-                                current_ts = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
-                        except Exception:
-                            pass
-                        # 重複除外チェック
-                        if current_ts is not None and last_ts is not None:
-                            if abs(current_ts - last_ts) < 0.1:  # ±100ms以内
-                                continue  # 重複行をスキップ
-                        # compute clock_time from ts_from_file_start
-                        clock_str = ""
-                        try:
-                            base_s = None
-                            if idx_full >= 0 and idx_full < len(parts):
-                                # expected HH:MM:SS.mmm
-                                v = parts[idx_full]
-                                # parse to seconds
-                                h, m, rest = v.split(":")
-                                if "." in rest:
-                                    sec, ms = rest.split(".")
-                                else:
-                                    sec, ms = rest, "0"
-                                base_s = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
-                            if base_s is not None and video_start_dt is not None:
-                                dt = video_start_dt + timedelta(seconds=float(base_s))
-                                clock_str = dt.strftime("%H:%M:%S.%f")[:-3]
-                            elif base_s is not None:
-                                clock_str = hhmmss_ms(base_s)
-                        except Exception:
-                            clock_str = ""
-                        # append clock_time if header did not include it
-                        if "clock_time" not in cols:
-                            parts_out = ",".join(parts + [clock_str])
+                        if idx_full >= 0 and idx_full < len(parts):
+                            v = parts[idx_full]
+                            h, m, rest = v.split(":")
+                            if "." in rest:
+                                sec, ms = rest.split(".")
                         else:
-                            # if file already had clock_time, keep row as is
-                            parts_out = ",".join(parts)
-                        fo.write(parts_out + "\n")
-                        # 重複除外用のタイムスタンプ更新
-                        if current_ts is not None:
-                            last_ts = current_ts
-        print(f"[PARALLEL] merged -> {final_out}")
+                            sec, ms = rest, "0"
+                            current_ts = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
+                    except Exception:
+                        pass
+                    
+                    # 重複除外チェック
+                    if current_ts is not None and last_ts is not None:
+                        if abs(current_ts - last_ts) < 0.1:  # ±100ms以内
+                            continue  # 重複行をスキップ
+                    
+                    # compute clock_time from ts_from_file_start
+                    clock_str = ""
+                    try:
+                        base_s = None
+                        if idx_full >= 0 and idx_full < len(parts):
+                            # expected HH:MM:SS.mmm
+                            v = parts[idx_full]
+                            # parse to seconds
+                            h, m, rest = v.split(":")
+                            if "." in rest:
+                                sec, ms = rest.split(".")
+                        else:
+                            sec, ms = rest, "0"
+                            base_s = int(h) * 3600 + int(m) * 60 + int(sec) + int(ms[:3].ljust(3, '0')) / 1000.0
+                        if base_s is not None and video_start_dt is not None:
+                            dt = video_start_dt + timedelta(seconds=float(base_s))
+                            clock_str = dt.strftime("%H:%M:%S.%f")[:-3]
+                        elif base_s is not None:
+                            clock_str = hhmmss_ms(base_s)
+                    except Exception:
+                        clock_str = ""
+                    
+                    # append clock_time if header did not include it
+                    if "clock_time" not in cols:
+                        parts_out = ",".join(parts + [clock_str])
+                    else:
+                        # if file already had clock_time, keep row as is
+                        parts_out = ",".join(parts)
+                    
+                    fo.write(parts_out + "\n")
+                    
+                    # 重複除外用のタイムスタンプ更新
+                    if current_ts is not None:
+                        last_ts = current_ts
+    print(f"[PARALLEL] merged -> {final_out}")
 
     # Coverage verification for merged final CSV
     def _hhmmss_to_sec(s: str) -> Optional[float]:
@@ -1510,7 +1389,7 @@ def main() -> None:
         except Exception:
             return None, None
 
-    if int(args.final_merge) == 1 and int(args.verify_coverage) == 1 and total_sec > 0:
+    if int(args.verify_coverage) == 1 and total_sec > 0:
         min_s, max_s = _compute_coverage(final_out)
         if min_s is not None and max_s is not None:
             covered = max(0.0, float(max_s) - float(min_s))
@@ -1531,8 +1410,8 @@ def main() -> None:
         else:
             print("[WARN] could not compute coverage from merged CSV (no ts_from_file_start/timestamp)")
 
-    # RAWの結合（ユーザーが要求した場合のみ）
-    if args.raw_output.strip() and int(args.final_merge) == 1:
+    # RAWの結合（ユーザーが要求した場合）
+    if args.raw_output.strip():
         raw_final = args.raw_output.strip()
         raw_dir = os.path.dirname(raw_final)
         if raw_dir:
@@ -1598,8 +1477,6 @@ def main() -> None:
                     print(f"[WARN] raw coverage below expected: total_video~{total_sec:.1f}s, missing~{missing:.1f}s")
             else:
                 print("[WARN] could not compute coverage from raw merged CSV")
-    elif args.raw_output.strip() and int(args.final_merge) == 0:
-        print("[RAW] final merge disabled (--final-merge 0). Skipping RAW merge.")
 
 
 if __name__ == "__main__":

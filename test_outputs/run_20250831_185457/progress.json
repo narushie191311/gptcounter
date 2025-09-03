@@ -1,0 +1,20 @@
+{
+  "now_utc": "2025-08-31 09:55:12",
+  "now_jst": "2025-08-31 18:55:12",
+  "processed_sec": 27.932,
+  "percent": 93.11,
+  "eta_jst": "2025-08-31 18:55:13",
+  "fps": 15.0,
+  "video_ts": "11:45:27",
+  "gender_count": {
+    "Male": 0,
+    "Female": 419,
+    "": 0
+  },
+  "gender_age_mean": {
+    "Male": 0.0,
+    "Female": 30.0,
+    "": 0.0
+  },
+  "online_unique_persons": 1
+}
