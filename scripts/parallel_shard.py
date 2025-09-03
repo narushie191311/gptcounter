@@ -160,12 +160,12 @@ def main() -> None:
     ap.add_argument("--gpus", default="", help="comma-separated GPU ids for multi-GPU (e.g., 0,1)")
     ap.add_argument("--procs-per-gpu", type=int, default=1, help="parallel processes per GPU")
     ap.add_argument("--skip-existing", type=int, default=1, help="skip chunks already written (1=yes,0=no)")
-    ap.add_argument("--online-merge", type=int, default=0, help="enable analyzer online merge (1) or disable (0)")
+    ap.add_argument("--online-merge", type=int, default=1, help="enable analyzer online merge (1) or disable (0)")
     ap.add_argument("--retries", type=int, default=0, help="retry count per chunk on non-zero exit")
     ap.add_argument("--raw-output", default="", help="final merged RAW (non-merged-by-IDs) CSV path. If set, per-chunk raw files are auto-generated and merged here")
     ap.add_argument("--per-chunk-timeout-sec", type=float, default=0.0, help="kill a chunk if it exceeds this wall time (0=disable)")
     ap.add_argument("--prewarm-sec", type=float, default=2.0, help="run a short single analyzer to pre-download models (0=disable)")
-    ap.add_argument("--auto-tune", type=int, default=1, help="auto tune workers from GPU VRAM and host RAM (1=on)")
+    ap.add_argument("--auto-tune", type=int, default=0, help="auto tune workers from GPU VRAM and host RAM (1=on)")
     ap.add_argument("--gpu-monitor-sec", type=float, default=20.0, help="print GPU usage every N seconds (0=off)")
     ap.add_argument("--host-mem-per-proc-gb", type=float, default=2.0, help="estimated host RAM required per process (GB)")
     ap.add_argument("--verify-coverage", type=int, default=1, help="verify merged coverage against video length and print summary (1=on)")
@@ -235,78 +235,6 @@ def main() -> None:
     analyzer_path = str(scripts_dir / "analyze_video_mac.py")
     project_root = str(scripts_dir.parent)
 
-    # extra-args サニタイズ関数（analyze_video_mac.py 対応フラグのみに限定）
-    def _sanitize_extra_args(extra_str: str, online_merge_val: int, raw_mode: bool) -> List[str]:
-        if not extra_str.strip():
-            return []
-        try:
-            import shlex
-            tokens = shlex.split(extra_str)
-        except Exception:
-            tokens = extra_str.split()
-        allowed_flags = {
-            "--device",
-            "--merge-every-sec",
-            "--no-merge",
-            "--output-csv-raw",
-            "--detect-every-n",
-            "--det-size",
-            "--yolo-weights",
-            "--no-show",
-        }
-        needs_value = {
-            "--device",
-            "--merge-every-sec",
-            "--output-csv-raw",
-            "--detect-every-n",
-            "--det-size",
-            "--yolo-weights",
-        }
-        out: List[str] = []
-        i = 0
-        while i < len(tokens):
-            tok = tokens[i]
-            if tok.startswith("--"):
-                if "=" in tok:
-                    flag = tok.split("=", 1)[0]
-                    if flag in allowed_flags:
-                        if int(online_merge_val) == 0 and flag in {"--merge-every-sec", "--no-merge"}:
-                            pass  # 親側で管理
-                        else:
-                            out.append(tok)
-                    # else drop
-                    i += 1
-                    continue
-                if tok in allowed_flags:
-                    if int(online_merge_val) == 0 and tok in {"--merge-every-sec", "--no-merge"}:
-                        # 親側で管理するので落とす（必要なら後で付与）
-                        # 値が続くなら一緒にスキップ
-                        if tok in needs_value and i + 1 < len(tokens) and not tokens[i+1].startswith("--"):
-                            i += 2
-                        else:
-                            i += 1
-                        continue
-                    out.append(tok)
-                    if tok in needs_value and i + 1 < len(tokens) and not tokens[i+1].startswith("--"):
-                        out.append(tokens[i+1])
-                        i += 2
-                    else:
-                        i += 1
-                else:
-                    # 未対応フラグは値ごと捨てる
-                    if i + 1 < len(tokens) and not tokens[i+1].startswith("--"):
-                        i += 2
-                    else:
-                        i += 1
-            else:
-                # 先行フラグなしの値は捨てる
-                i += 1
-        # 非RAW時かつonline-merge=0なら一定のフラッシュ間隔を保証
-        if int(online_merge_val) == 0 and not raw_mode:
-            if "--merge-every-sec" not in out and not any(t.startswith("--merge-every-sec=") for t in out):
-                out += ["--merge-every-sec", "30"]
-        return out
-
     # auto decide shards
     shards = int(args.shards)
     if shards <= 0:
@@ -335,8 +263,7 @@ def main() -> None:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
             print(f"[WARMUP] RAW mode: --no-merge enabled for raw feature extraction")
         if args.extra_args.strip():
-            # warmupはRAWモード扱い（no-merge指定）だが、extra-argsはサニタイズ
-            cmd += _sanitize_extra_args(args.extra_args, args.online_merge, raw_mode=bool(int(args.online_merge) == 0))
+            cmd += args.extra_args.strip().split()
         print(f"[WARMUP] measuring throughput for {sample_sec:.1f}s on device={warmup_device} ...")
         t0 = time.time()
         run_rc = run_proc_streaming(cmd, cwd=project_root, per_chunk_timeout_sec=max(30.0, sample_sec * 10), suppress_init=bool(int(args.quiet)))
@@ -392,7 +319,7 @@ def main() -> None:
             cmd += ["--no-merge", "--merge-every-sec", "0"]
             print(f"[PREWARM] RAW mode: --no-merge enabled for raw feature extraction")
         if args.extra_args.strip():
-            cmd += _sanitize_extra_args(args.extra_args, args.online_merge, raw_mode=bool(int(args.online_merge) == 0))
+            cmd += args.extra_args.strip().split()
         print("[PREWARM] starting a short run to pre-download models and warm caches...")
         _ = run_proc_streaming(cmd, cwd=project_root, per_chunk_timeout_sec=max(60.0, float(args.prewarm_sec) * 20), suppress_init=bool(int(args.quiet)))
         try:
@@ -573,8 +500,8 @@ def main() -> None:
     if args.raw_output.strip():
         print(f"[RAW] will generate per-chunk raw files and merge to: {args.raw_output}")
         if int(args.online_merge) == 0:
-            print(f"[RAW] INFO: --online-merge 0 detected. For RAW, using --merge-every-sec 0 (child flush interval≈1s)")
-            print(f"[RAW] DEBUG: Child will write raw CSV rows frequently for continuous monitoring")
+            print(f"[RAW] INFO: --online-merge 0 detected, but RAW files require merging. Auto-enabling --merge-every-sec 300")
+            print(f"[RAW] DEBUG: This ensures child processes can write data to raw CSV files")
         else:
             print(f"[RAW] INFO: Using --merge-every-sec 30 for online merging")
 
@@ -799,86 +726,31 @@ def main() -> None:
                 tokens = shlex.split(extra)
             except Exception:
                 tokens = extra.split()
-            # filter to only flags supported by analyze_video_mac.py
-            allowed_flags = {
-                "--device",
-                "--merge-every-sec",
-                "--no-merge",
-                "--output-csv-raw",
-                "--detect-every-n",
-                "--det-size",
-                "--yolo-weights",
-                "--no-show",
-            }
-            needs_value = {
-                "--device",
-                "--merge-every-sec",
-                "--output-csv-raw",
-                "--detect-every-n",
-                "--det-size",
-                "--yolo-weights",
-            }
             filtered_extra = []
             filtered_out = []
-            i = 0
-            while i < len(tokens):
-                tok = tokens[i]
-                if tok.startswith("--"):
-                    if "=" in tok:
-                        flag = tok.split("=", 1)[0]
-                        if flag in allowed_flags:
-                            # also strip merge flags when online-merge=0 to avoid conflicts; we'll control them ourselves
-                            if int(args.online_merge) == 0 and flag in {"--merge-every-sec", "--no-merge"}:
-                                filtered_out.append(tok)
-                            else:
-                                filtered_extra.append(tok)
-                        else:
-                            filtered_out.append(tok)
-                        i += 1
-                        continue
-                    # token without '='
-                    if tok in allowed_flags:
-                        if int(args.online_merge) == 0 and tok in {"--merge-every-sec", "--no-merge"}:
-                            filtered_out.append(tok)
-                            # skip its value if any
-                            if tok in needs_value and i + 1 < len(tokens) and not tokens[i+1].startswith("--"):
-                                filtered_out.append(tokens[i+1])
-                                i += 2
-                            else:
-                                i += 1
-                            continue
-                        filtered_extra.append(tok)
-                        if tok in needs_value and i + 1 < len(tokens) and not tokens[i+1].startswith("--"):
-                            filtered_extra.append(tokens[i+1])
-                            i += 2
-                        else:
-                            i += 1
-                    else:
-                        # unknown flag: drop it and its value if looks like a value
-                        filtered_out.append(tok)
-                        if i + 1 < len(tokens) and not tokens[i+1].startswith("--"):
-                            filtered_out.append(tokens[i+1])
-                            i += 2
-                        else:
-                            i += 1
-                else:
-                    # stray value, drop
-                    filtered_out.append(tok)
-                    i += 1
-            # After sanitization, apply merge policy
             if int(args.online_merge) == 0:
-                if raw_csv is not None and raw_csv.strip():
-                    # Ensure RAW mode flags (we add them below separately already)
-                    pass
-                else:
-                    # ensure some flushing interval for non-RAW executions
-                    if "--merge-every-sec" not in filtered_extra and not any(t.startswith("--merge-every-sec=") for t in filtered_extra):
-                        filtered_extra += ["--merge-every-sec", "30"]
-            if filtered_out:
-                print(f"[CMD-FILTER] filtered out unsupported/managed flags: {' '.join(filtered_out)}")
-            if filtered_extra:
-                print(f"[CMD-FILTER] remaining extra args: {' '.join(filtered_extra)}")
-            cmd += filtered_extra
+                i = 0
+                while i < len(tokens):
+                    token = tokens[i]
+                    # マージ関連のフラグをスキップ
+                    if token in ["--no-merge", "--merge-every-sec", "--online-merge"]:
+                        filtered_out.append(token)
+                        i += 1
+                        # 値付きの --merge-every-sec を丸ごと外す
+                        if token == "--merge-every-sec" and i < len(tokens):
+                            filtered_out.append(tokens[i])
+                            i += 1
+                        continue
+                    filtered_extra.append(token)
+                    i += 1
+                if filtered_out:
+                    print(f"[CMD-FILTER] filtered out merge flags: {' '.join(filtered_out)}")
+                if filtered_extra:
+                    print(f"[CMD-FILTER] remaining extra args: {' '.join(filtered_extra)}")
+                cmd += filtered_extra
+            else:
+                # online-merge が有効な場合は extra-args をそのまま適用
+                cmd += tokens
         
         # デバッグ用：最終的なコマンドを表示（マージ関連のフラグが正しく処理されているか確認）
         merge_flags = [flag for flag in cmd if flag in ["--no-merge", "--merge-every-sec"]]
