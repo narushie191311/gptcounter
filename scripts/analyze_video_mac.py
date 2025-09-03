@@ -213,6 +213,8 @@ def main():
     flush_interval = max(1.0, float(args.merge_every_sec))  # 互換フラグをフラッシュ間隔に活用
     processed_frames = 0
     emitted_rows = 0
+    last_logged_rows_csv = 0
+    last_logged_rows_raw = 0
 
     # 推定終了フレーム（総尺がわかる場合）
     if math.isfinite(end_time_sec):
@@ -272,6 +274,31 @@ def main():
                     f_raw.flush(); os.fsync(f_raw.fileno())
             except Exception:
                 pass
+            # ログ: CSV/RAWの行数と現在時刻（ファイル先頭からの秒）
+            try:
+                # CSV行数
+                csv_rows = 0
+                try:
+                    f_csv.flush(); os.fsync(f_csv.fileno())
+                except Exception:
+                    pass
+                try:
+                    with open(args.output_csv, 'r') as rf:
+                        csv_rows = max(0, sum(1 for _ in rf) - 1)
+                except Exception:
+                    csv_rows = last_logged_rows_csv
+                raw_rows = 0
+                if f_raw and args.output_csv_raw:
+                    try:
+                        with open(args.output_csv_raw, 'r') as rr:
+                            raw_rows = max(0, sum(1 for _ in rr) - 1)
+                    except Exception:
+                        raw_rows = last_logged_rows_raw
+                print(f"{now_prefix(pos_sec_file)} [FLUSH] csv_rows={csv_rows} raw_rows={raw_rows} time={ts_hhmmss_ms(pos_sec_file)}")
+                last_logged_rows_csv = csv_rows
+                last_logged_rows_raw = raw_rows
+            except Exception:
+                pass
             last_flush = now
 
         # 次へ
@@ -283,6 +310,21 @@ def main():
         f_csv.flush(); os.fsync(f_csv.fileno())
         if f_raw:
             f_raw.flush(); os.fsync(f_raw.fileno())
+        # 終了時の最終ログ
+        try:
+            csv_rows = 0
+            with open(args.output_csv, 'r') as rf:
+                csv_rows = max(0, sum(1 for _ in rf) - 1)
+        except Exception:
+            csv_rows = last_logged_rows_csv
+        raw_rows = 0
+        if f_raw and args.output_csv_raw:
+            try:
+                with open(args.output_csv_raw, 'r') as rr:
+                    raw_rows = max(0, sum(1 for _ in rr) - 1)
+            except Exception:
+                raw_rows = last_logged_rows_raw
+        print(f"{now_prefix(pos_sec_file)} [FLUSH-END] csv_rows={csv_rows} raw_rows={raw_rows}")
     except Exception:
         pass
     f_csv.close()
