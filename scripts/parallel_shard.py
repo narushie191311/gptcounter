@@ -424,11 +424,6 @@ def main() -> None:
         else:
             max_workers = min(max_workers, wanted)
 
-    # Initialize auto-quality defaults (may be overridden by auto-tune below)
-    auto_yolo = None
-    auto_det = None
-    auto_dn: Optional[int] = None
-
     # auto-tune procs-per-gpu by VRAM
     def _read_gpu_mem_mb() -> List[tuple]:
         try:
@@ -909,7 +904,7 @@ def main() -> None:
             env = os.environ.copy()
         # safety envs to avoid TRT/CUDA provider conflicts and reduce spam
         env.setdefault("PYTHONUNBUFFERED", "1")
-        # env.setdefault("PYTHONNOUSERSITE", "1")  # removed to allow local user-site packages (e.g., cv2)
+        env.setdefault("PYTHONNOUSERSITE", "1")  # avoid mixing user-site pkgs (ABI mismatch)
         # MPSで未実装opが出た場合にCPUフォールバックを許可
         env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         # TensorRTとCUDA関連の環境変数を強化して初期化エラーを防止
@@ -1195,67 +1190,67 @@ def main() -> None:
             gpu_env = None
             if gpu_ids:
                 gpu_env = gpu_ids[i % len(gpu_ids)]
-            # RAW出力のパスを常に解決（GPU有無に関係なく）
-            raw_op = None
-            if args.raw_output.strip():
-                raw_op = raw_by_start.get(int(s))
-                print(f"[RAW-DEBUG] chunk {s}s: raw_output='{args.raw_output}', start_sec={int(s)}, raw_op='{raw_op}'")
-            else:
-                print(f"[RAW-DEBUG] chunk {s}s: raw_output is empty, raw_op=None")
-            cmd, env = make_cmd(s, d, op, gpu_env, raw_op, auto_yolo, auto_det, auto_dn)
-            dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
-            print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
-            prefix = f"[CHUNK s={int(s)} dur={dur_str}] "
-            # wrap with retries
-            def worker(c=cmd, e=env, pref=prefix, start_sec=s, dur=d, out_path=op):
-                def _cb(line: str, key=start_sec):
-                    _parse_child_progress(line, key)
-                # 登録（初期値0.0）とディスパッチ時刻/期待スパン
-                with lock:
-                    progress_map.setdefault(start_sec, 0.0)
-                    dispatch_time[start_sec] = time.time()
-                    w = (float(total_sec) - start_sec) if (dur == 0.0 and total_sec > 0) else float(dur)
-                    expected_span[start_sec] = max(0.0, w)
-                # 動的タイムアウト（ユーザー未指定の場合のみ）
-                timeout_sec = float(args.per_chunk_timeout_sec) if args.per_chunk_timeout_sec else 0.0
-                if timeout_sec <= 0.0:
+                raw_op = None
+                if args.raw_output.strip():
+                    # use start_sec to look up raw file path
+                    raw_op = raw_by_start.get(int(s))
+                    print(f"[RAW-DEBUG] chunk {s}s: raw_output='{args.raw_output}', start_sec={int(s)}, raw_op='{raw_op}'")
+                else:
+                    print(f"[RAW-DEBUG] chunk {s}s: raw_output is empty, raw_op=None")
+                cmd, env = make_cmd(s, d, op, gpu_env, raw_op, auto_yolo, auto_det, auto_dn)
+                dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
+                print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
+                prefix = f"[CHUNK s={int(s)} dur={dur_str}] "
+                # wrap with retries
+                def worker(c=cmd, e=env, pref=prefix, start_sec=s, dur=d, out_path=op):
+                    def _cb(line: str, key=start_sec):
+                        _parse_child_progress(line, key)
+                    # 登録（初期値0.0）とディスパッチ時刻/期待スパン
                     with lock:
-                        w = expected_span.get(start_sec, float(dur if dur > 0.0 else max(0.0, float(total_sec) - start_sec)))
-                        vps = speed_ema[0] if speed_ema[0] > 0 else 0.0
-                    # 推定: 期待時間 = w / max(vps, 0.5)
-                    exp_wall = (w / max(0.5, vps)) if vps > 0 else max(300.0, w)  # vps未知ならw秒相当、最低5分
-                    timeout_sec = max(600.0, exp_wall * 3.0)  # 3倍の余裕
-                with lock:
-                    start_wall_map[start_sec] = time.time()
-                rc = run_proc_streaming(c, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)))
-                tries = 0
-                while rc != 0 and tries < int(args.retries):
-                    tries += 1
-                    # リトライは軽量化オーバーライドを追加（末尾優先で上書き）
-                    print(f"[RETRY] start={start_sec:.1f}s try={tries} rc={rc} -> applying light overrides")
-                    c2 = list(c)
-                    # 軽量化: 検出間引き+1（最大4）、解像度を段階的に下げ、モデルも段階的に小さく
-                    light_args = []
-                    try:
-                        # detect-every-n override
-                        light_args += ["--detect-every-n", str( min(4, 2 + tries) )]
-                        # det-size override
-                        # 段階: 2048 -> 1920 -> 1536
-                        det_map = {1: "2048x2048", 2: "1920x1920", 3: "1536x1536", 4: "1280x1280"}
-                        light_args += ["--det-size", det_map.get(tries, "1280x1280")]
-                        # yolo weights override
-                        yolo_seq = ["yolov8x.pt", "yolov8l.pt", "yolov8m.pt", "yolov8n.pt"]
-                        idx = min(tries, len(yolo_seq)-1)
-                        light_args += ["--yolo-weights", yolo_seq[idx]]
-                    except Exception:
-                        pass
-                    c2 += light_args
-                    # 次回タイムアウトも動的
+                        progress_map.setdefault(start_sec, 0.0)
+                        dispatch_time[start_sec] = time.time()
+                        w = (float(total_sec) - start_sec) if (dur == 0.0 and total_sec > 0) else float(dur)
+                        expected_span[start_sec] = max(0.0, w)
+                    # 動的タイムアウト（ユーザー未指定の場合のみ）
+                    timeout_sec = float(args.per_chunk_timeout_sec) if args.per_chunk_timeout_sec else 0.0
+                    if timeout_sec <= 0.0:
+                        with lock:
+                            w = expected_span.get(start_sec, float(dur if dur > 0.0 else max(0.0, float(total_sec) - start_sec)))
+                            vps = speed_ema[0] if speed_ema[0] > 0 else 0.0
+                        # 推定: 期待時間 = w / max(vps, 0.5)
+                        exp_wall = (w / max(0.5, vps)) if vps > 0 else max(300.0, w)  # vps未知ならw秒相当、最低5分
+                        timeout_sec = max(600.0, exp_wall * 3.0)  # 3倍の余裕
                     with lock:
                         start_wall_map[start_sec] = time.time()
-                    rc = run_proc_streaming(c2, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)))
-                return (rc, start_sec, dur, out_path)
-            futs.append(ex.submit(worker))
+                    rc = run_proc_streaming(c, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)))
+                    tries = 0
+                    while rc != 0 and tries < int(args.retries):
+                        tries += 1
+                        # リトライは軽量化オーバーライドを追加（末尾優先で上書き）
+                        print(f"[RETRY] start={start_sec:.1f}s try={tries} rc={rc} -> applying light overrides")
+                        c2 = list(c)
+                        # 軽量化: 検出間引き+1（最大4）、解像度を段階的に下げ、モデルも段階的に小さく
+                        light_args = []
+                        try:
+                            # detect-every-n override
+                            light_args += ["--detect-every-n", str( min(4, 2 + tries) )]
+                            # det-size override
+                            # 段階: 2048 -> 1920 -> 1536
+                            det_map = {1: "2048x2048", 2: "1920x1920", 3: "1536x1536", 4: "1280x1280"}
+                            light_args += ["--det-size", det_map.get(tries, "1280x1280")]
+                            # yolo weights override
+                            yolo_seq = ["yolov8x.pt", "yolov8l.pt", "yolov8m.pt", "yolov8n.pt"]
+                            idx = min(tries, len(yolo_seq)-1)
+                            light_args += ["--yolo-weights", yolo_seq[idx]]
+                        except Exception:
+                            pass
+                        c2 += light_args
+                        # 次回タイムアウトも動的
+                        with lock:
+                            start_wall_map[start_sec] = time.time()
+                        rc = run_proc_streaming(c2, e, project_root, timeout_sec, pref, _cb, suppress_init=bool(int(args.quiet)))
+                    return (rc, start_sec, dur, out_path)
+                futs.append(ex.submit(worker))
         for fut in as_completed(futs):
                 rc, start_sec_done, dur_done, out_csv_path = fut.result()
                 rcodes.append(rc)
