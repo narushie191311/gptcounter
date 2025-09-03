@@ -174,6 +174,7 @@ def main() -> None:
     ap.add_argument("--quiet", type=int, default=0, help="suppress noisy child init logs and compact progress (1=on)")
     ap.add_argument("--max-chunk-eta", type=int, default=8, help="max number of per-chunk ETA items to render in progress line")
     ap.add_argument("--final-merge", type=int, default=0, help="perform final merged CSV/RAW outputs at end (1=yes,0=no; default 0)")
+    ap.add_argument("--min-chunk-sec", type=float, default=1.0, help="skip dispatching micro-chunks shorter than this (after resume)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -1143,6 +1144,20 @@ def main() -> None:
                         if bool(int(args.quiet)):
                             print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% ({done:.1f}s/{total_sec:.1f}s) elapsed={elapsed/60:.1f}m ETA={_format_eta(max(0.0, remain_sec))}")
                         else:
+                            # 詳細（各チャンクETA）のためのpartsを再構築
+                            parts = []
+                            for (s, d, _) in chunks:
+                                w = (float(total_sec) - s) if (d == 0.0 and total_sec > 0) else float(d)
+                                w = max(0.0, w)
+                                p = progress_map.get(s, 0.0)
+                                st = start_wall_map.get(s, None)
+                                eta_c = None
+                                if st is not None and p > 0 and w > 0:
+                                    elapsed_c = now_ts - st
+                                    speed_c = (w * p) / max(1e-6, elapsed_c)
+                                    remain_c = (w * (1.0 - p)) / max(1e-6, speed_c)
+                                    eta_c = remain_c
+                                parts.append(f"s={int(s)} {p*100:.1f}% ETA={eta_c/60:.1f}m" if eta_c is not None else f"s={int(s)} {p*100:.1f}%")
                             max_items = max(0, int(args.max_chunk_eta))
                             head = parts[:max_items]
                             print(f"[GLOBAL] chunks={len(chunks)} progress={frac:.2f}% ({done:.1f}s/{total_sec:.1f}s) elapsed={elapsed/60:.1f}m ETA={_format_eta(max(0.0, remain_sec))} | { ' | '.join(head)}{' ...' if len(parts)>max_items else ''}")
@@ -1206,13 +1221,34 @@ def main() -> None:
             gpu_env = None
             if gpu_ids:
                 gpu_env = gpu_ids[i % len(gpu_ids)]
-            # RAW出力のパスを常に解決（GPU有無に関係なく）
+            # RAW出力のパスを常に解決（レジュームでstartがズレても out_csv から導出）
             raw_op = None
             if args.raw_output.strip():
-                raw_op = raw_by_start.get(int(s))
-                print(f"[RAW-DEBUG] chunk {s}s: raw_output='{args.raw_output}', start_sec={int(s)}, raw_op='{raw_op}'")
+                try:
+                    import re as _re
+                    m = _re.search(r"_chunk_(\d+)s\.csv$", op)
+                    if m:
+                        start_token = m.group(1)
+                        raw_op = os.path.join(work_dir, f"{base_name}_raw_chunk_{start_token}s.csv")
+                    else:
+                        # フォールバック: もとの辞書から近いキーを探す
+                        if raw_by_start:
+                            keys = sorted(raw_by_start.keys())
+                            # 最大の key <= 現在の start を選ぶ
+                            cand = None
+                            for k in keys:
+                                if k <= int(s):
+                                    cand = k
+                                else:
+                                    break
+                            if cand is None:
+                                cand = keys[0]
+                            raw_op = raw_by_start.get(cand)
+                except Exception:
+                    raw_op = None
+                print(f"[RAW-DEBUG] chunk {s}s: raw_output='{args.raw_output}', derived_raw_op='{raw_op}' out_csv='{op}'")
             else:
-                print(f"[RAW-DEBUG] chunk {s}s: raw_output is empty, raw_op=None")
+                print(f"[RAW-DEBUG] chunk {s}s: raw_output is empty, raw_op=None out_csv='{op}'")
             cmd, env = make_cmd(s, d, op, gpu_env, raw_op, auto_yolo, auto_det, auto_dn)
             dur_str = 'tail' if (d == 0.0 and total_sec > 0) else f"{d:.1f}"
             print(f"[DISPATCH] start={s:.1f}s dur={dur_str}s -> {op} gpu={gpu_env}")
@@ -1492,7 +1528,6 @@ def main() -> None:
                         # 重複除外用のタイムスタンプ更新
                         if current_ts is not None:
                             last_ts = current_ts
-    print(f"[PARALLEL] merged -> {final_out}")
 
     # Coverage verification for merged final CSV
     def _hhmmss_to_sec(s: str) -> Optional[float]:
