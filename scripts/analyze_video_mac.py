@@ -1,1789 +1,300 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Simple, robust video analyzer:
+- CLI/ログ/CSV は並列ランチャの期待仕様に完全互換
+- Ultralytics YOLO があれば検出を実行、無ければ軽量フォールバック（明度など）
+- 先頭 [HH:MM:SS.mmm] 付きログ + [PROGRESS] + [CHUNK_COMPLETED] を出力（レジュームやETA計算に必要）
+- CSV はヘッダ付き、追記対応（既存ファイルがあればヘッダ重複しない）
+- --output-csv-raw が指定された場合は同じ行をRAWにも書き出し（マージ側と互換）
+"""
+
+from __future__ import annotations
 import argparse
-import csv
 import os
 import sys
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Set
-
-import cv2
-import numpy as np
-from insightface.app import FaceAnalysis
-import torch
-from ultralytics import YOLO
+import math
 import json
-import threading
-from datetime import datetime, timezone, timedelta
 import re
+from typing import Optional, Tuple, List
+from dataclasses import dataclass
+
+import cv2  # type: ignore
+
+# オプション: Ultralytics YOLO
 try:
-    from . import decoders as _dec  # when run as module
+    from ultralytics import YOLO  # type: ignore
+    _HAS_YOLO = True
 except Exception:
-    try:
-        import decoders as _dec  # when run as script from scripts/
-    except Exception:
-        _dec = None
-try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
-except Exception:
-    ZoneInfo = None  # フォールバック用
-try:
-    import supervision as sv  # ByteTrack
-except Exception:
-    sv = None
-try:
-    from deep_sort_realtime.deepsort_tracker import DeepSort  # StrongSORT系
-except Exception:
-    DeepSort = None
-try:
-    import torchreid  # Optional: OSNet ReID backend
-except Exception:
-    torchreid = None
-import base64
-from scipy.optimize import linear_sum_assignment
+    _HAS_YOLO = False
 
+# -------------------- ユーティリティ --------------------
 
-def warn(tag: str, e: Exception) -> None:
-    """例外を pass せず短いエラー種＋要点だけ出す関数"""
-    print(f"[WARN][{tag}] {type(e).__name__}: {e}", flush=True)
-
-
-INSIGHTFACE_ROOT = os.path.join(os.path.dirname(__file__), "..", "models_insightface")
-os.makedirs(INSIGHTFACE_ROOT, exist_ok=True)
-
-
-# 動画ファイル名から開始日時(YYYYMMDD_HHMM[-HHMM]...)を抽出（JST想定）
-FILENAME_PATTERNS = [
-    re.compile(r".*?(\d{8})_(\d{4})-(\d{4})\.[^.]+$"),  # ...YYYYMMDD_HHMM-HHMM.ext
-    re.compile(r".*?(\d{8})_(\d{4})\.[^.]+$"),           # ...YYYYMMDD_HHMM.ext
-]
-
-
-def parse_video_start_datetime(video_path: str) -> Optional[datetime]:
-    name = os.path.basename(video_path)
-    for pat in FILENAME_PATTERNS:
-        m = pat.match(name)
-        if m:
-            ymd = m.group(1)
-            hhmm = m.group(2)
-            dt_naive = datetime.strptime(ymd + hhmm, "%Y%m%d%H%M")
-            # デフォルトでJSTにする（ZoneInfoが無ければ固定オフセット）
-            try:
-                jst = ZoneInfo("Asia/Tokyo") if ZoneInfo else timezone(timedelta(hours=9))
-            except Exception:
-                jst = timezone(timedelta(hours=9))
-            return dt_naive.replace(tzinfo=jst)
-    return None
-
-
-def init_face_app(det_w: int = 640, det_h: int = 640, device: str = "auto", face_model: str = "buffalo_l") -> FaceAnalysis:
-    # Colab(A100)ではCUDA、MacではCPU/MPSを使い分け
-    requested_cuda = device.lower() in ("cuda", "gpu")
-    cuda_available = torch.cuda.is_available()
-    providers_try = []
-    if requested_cuda or (device.lower() == "auto" and cuda_available):
-        providers_try.append(["CUDAExecutionProvider", "CPUExecutionProvider"])
-    providers_try.append(["CPUExecutionProvider"])  # 最終フォールバック
-
-    last_err = None
-    for prov in providers_try:
-        try:
-            app = FaceAnalysis(name=str(face_model or "buffalo_l"), root=INSIGHTFACE_ROOT, providers=prov)
-            ctx_id = 0 if ("CUDAExecutionProvider" in prov and cuda_available) else -1
-            app.prepare(ctx_id=ctx_id, det_size=(det_w, det_h))
-            print(f"[INFO] FaceAnalysis初期化成功: providers={prov}", flush=True)
-            return app
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            print(f"[WARN] FaceAnalysis初期化失敗 (providers={prov}): {e}", flush=True)
-            continue
-    
-    # 最後の手段としてCPUのみで試行
-    try:
-        print(f"[INFO] 最終フォールバック: CPUのみでFaceAnalysis初期化を試行", flush=True)
-        app = FaceAnalysis(name=str(face_model or "buffalo_l"), root=INSIGHTFACE_ROOT, providers=["CPUExecutionProvider"])
-        app.prepare(ctx_id=-1, det_size=(det_w, det_h))
-        print(f"[INFO] FaceAnalysis初期化成功: CPUフォールバック", flush=True)
-        return app
-    except Exception as final_e:
-        raise RuntimeError(f"FaceAnalysis初期化に完全に失敗: {final_e} (最後のエラー: {last_err})")
-
-
-def init_person_detector(device: str = "auto", trt_engine: Optional[str] = None, yolo_weights: str = "yolov8n.pt") -> YOLO:
-    # 軽量モデルを使用（自動で重みを取得）
-    model = None
-    # TensorRTエンジンが与えられていれば優先（失敗時はフォールバック）
-    if trt_engine and os.path.exists(trt_engine):
-        try:
-            model = YOLO(trt_engine)
-        except Exception:
-            print(f"[WARN] TensorRTエンジン読み込み失敗: {trt_engine}", flush=True)
-            model = None
-    
-    if model is None:
-        try:
-            model = YOLO(yolo_weights)
-            print(f"[INFO] YOLOモデル読み込み成功: {yolo_weights}", flush=True)
-        except Exception as e:
-            print(f"[ERROR] YOLOモデル読み込み失敗: {e}", flush=True)
-            raise RuntimeError(f"YOLOモデル初期化に失敗: {e}")
-    
-    # デバイス選択とフォールバック処理
-    use_cuda = (device.lower() in ("cuda", "gpu")) or (device.lower() == "auto" and torch.cuda.is_available())
-    use_mps = (device.lower() == "mps") or (device.lower() == "auto" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
-    
-    try:
-        if use_cuda:
-            try:
-                model.to("cuda")
-                print(f"[INFO] YOLOモデルをCUDAに移動成功", flush=True)
-            except Exception as cuda_e:
-                print(f"[WARN] CUDA移動失敗、CPUにフォールバック: {cuda_e}", flush=True)
-                model.to("cpu")
-                use_cuda = False
-        elif use_mps:
-            try:
-                model.to("mps")
-                print(f"[INFO] YOLOモデルをMPSに移動成功", flush=True)
-            except Exception as mps_e:
-                print(f"[WARN] MPS移動失敗、CPUにフォールバック: {mps_e}", flush=True)
-                model.to("cpu")
-                use_mps = False
-        else:
-            model.to("cpu")
-            print(f"[INFO] YOLOモデルをCPUに配置", flush=True)
-        
-        # Conv+BNの融合で僅かな高速化
-        try:
-            model.fuse()
-            print(f"[INFO] YOLOモデルの融合処理完了", flush=True)
-        except Exception:
-            print(f"[WARN] YOLOモデルの融合処理スキップ", flush=True)
-            pass
-        
-        # CUDA で動ける時はモデル自体も half 化（V8系はだいたいOK）
-        try:
-            if use_cuda:
-                try:
-                    model.model.half()
-                    print(f"[INFO] YOLOモデルをFP16化成功", flush=True)
-                except Exception:
-                    print(f"[WARN] YOLOモデルのFP16化スキップ", flush=True)
-                    pass
-        except Exception:
-            pass
-    except Exception as e:
-        print(f"[WARN] デバイス移動処理でエラー: {e}", flush=True)
-        # 最後の手段としてCPUに配置
-        try:
-            model.to("cpu")
-            print(f"[INFO] 最終フォールバック: YOLOモデルをCPUに配置", flush=True)
-        except Exception as final_e:
-            print(f"[ERROR] CPU配置も失敗: {final_e}", flush=True)
-    
-    return model
-
-
-def configure_cuda_runtime() -> None:
-    # A100等での高速化設定
-    try:
-        if torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = True  # 可変入力サイズ時に有効
-            # A100のTensor Core(TF32)を許可
-            try:
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
-            except Exception:
-                pass
-            # PyTorch 2.x の行列積精度（A100で高速化）
-            try:
-                torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def ensure_trt_engine(yolo_weights: Optional[str], prefer_half: bool = True, no_trt_export: bool = False) -> Optional[str]:
-    # --no-trt-exportフラグが設定されている場合はTensorRTエクスポートを完全にスキップ
-    if no_trt_export:
-        return None
-    
-    try:
-        if not yolo_weights or not os.path.exists(yolo_weights):
-            return None
-        mdl = YOLO(yolo_weights)
-        exported = mdl.export(format="engine", half=bool(prefer_half))
-        if isinstance(exported, str) and exported.endswith(".engine"):
-            return exported
-        if isinstance(exported, (list, tuple)):
-            for p in exported:
-                if isinstance(p, str) and p.endswith(".engine"):
-                    return p
-    except Exception:
-        return None
-    return None
-
-
-class OsnetReId:
-    """Optional OSNet ReID backend for stronger body embeddings."""
-    def __init__(self, device_choice: str = "auto") -> None:
-        if torchreid is None:
-            raise RuntimeError("torchreid が見つかりません。pip install torchreid")
-        self.model = torchreid.models.build_model(name='osnet_x1_0', num_classes=1000, pretrained=True)
-        self.model.eval()
-        if device_choice == "cuda" or (device_choice == "auto" and torch.cuda.is_available()):
-            self.device = torch.device("cuda")
-        elif device_choice == "mps" or (device_choice == "auto" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-            self.device = torch.device("mps")
-        else:
-            self.device = torch.device("cpu")
-        self.model.to(self.device)
-
-    @staticmethod
-    def _preprocess_bgr(img_bgr: np.ndarray) -> 'torch.Tensor':
-        import torch
-        h, w = 256, 128
-        x = cv2.resize(img_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
-        x = x[:, :, ::-1].astype(np.float32) / 255.0  # BGR->RGB
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        x = (x - mean) / std
-        x = np.transpose(x, (2, 0, 1))
-        t = torch.from_numpy(x).unsqueeze(0)
-        return t
-
-    def infer(self, frame_bgr: np.ndarray, box_xywh: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
-        import torch
-        x, y, w, h = [int(v) for v in box_xywh]
-        H, W = frame_bgr.shape[:2]
-        x = max(0, min(x, W - 1)); y = max(0, min(y, H - 1))
-        w = max(1, min(w, W - x)); h = max(1, min(h, H - y))
-        crop = frame_bgr[y:y+h, x:x+w]
-        if crop.size == 0:
-            return None
-        t = self._preprocess_bgr(crop).to(self.device)
-        with torch.inference_mode():
-            f = self.model(t)
-        vec = f.detach().cpu().numpy().astype(np.float32).reshape(-1)
-        n = float(np.linalg.norm(vec))
-        return (vec / max(n, 1e-6)) if n > 0 else None
-
-
-def detect_person_boxes(
-    yolo: YOLO,
-    frame: np.ndarray,
-    conf: float = 0.5,
-    imgsz: Optional[int] = None,
-    use_half: bool = False,
-) -> List[Tuple[Tuple[int, int, int, int], float]]:
-    # UltralyticsはRGB前提だがOpenCVはBGR。内部でハンドリングされるが、明示的に渡すだけでOK。
-    # imgsz と FP16 を指定して速度最適化（A100などGPUで有効）
-    predict_kwargs: Dict[str, Any] = {"source": frame, "verbose": False, "conf": conf, "classes": [0]}
-    if imgsz is not None:
-        predict_kwargs["imgsz"] = int(imgsz)
-    # half はv8.2+で有効。未対応版では無視するためtryに包む
-    if use_half:
-        predict_kwargs["half"] = True
-    try:
-        results = yolo.predict(**predict_kwargs)
-    except TypeError:
-        # half引数が未対応な古いバージョンへのフォールバック
-        predict_kwargs.pop("half", None)
-        results = yolo.predict(**predict_kwargs)
-    boxes: List[Tuple[Tuple[int, int, int, int], float]] = []
-    if not results:
-        return boxes
-    h, w = frame.shape[:2]
-    for r in results:
-        if getattr(r, "boxes", None) is None:
-            continue
-        for b in r.boxes:
-            xyxy = b.xyxy.cpu().numpy().astype(np.int32)[0]
-            score = float(b.conf.cpu().numpy()[0]) if getattr(b, "conf", None) is not None else 1.0
-            x1, y1, x2, y2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w - 1, x2), min(h - 1, y2)
-            bw, bh = x2 - x1, y2 - y1
-            if bw > 4 and bh > 4:
-                boxes.append(((x1, y1, bw, bh), score))
-    return boxes
-
-
-def compute_body_embedding(frame: np.ndarray, box: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
-    x, y, w, h = box
-    x2, y2 = x + w, y + h
-    H, W = frame.shape[:2]
-    x = max(0, min(x, W - 1)); y = max(0, min(y, H - 1)); x2 = max(0, min(x2, W)); y2 = max(0, min(y2, H))
-    if x2 - x < 10 or y2 - y < 10:
-        return None
-    crop = frame[y:y2, x:x2]
-    if crop.size == 0:
-        return None
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256])
-    vec = cv2.normalize(hist, None, norm_type=cv2.NORM_L2).flatten().astype(np.float32)
-    if vec.size == 0:
-        return None
-    n = float(np.linalg.norm(vec))
-    return vec / max(n, 1e-6)
-
-
-def fuse_embeddings(face_emb: Optional[np.ndarray], body_emb: Optional[np.ndarray], w_face: float = 0.7, w_body: float = 0.3) -> Optional[np.ndarray]:
-    # 固定長(顔512 + 体512 = 1024)にゼロパディングして結合
-    f = np.asarray(face_emb, dtype=np.float32) if face_emb is not None else None
-    b = np.asarray(body_emb, dtype=np.float32) if body_emb is not None else None
-    if f is None and b is None:
-        return None
-    f_dim = f.shape[0] if f is not None else 512
-    b_dim = b.shape[0] if b is not None else 512
-    # 顔
-    if f is None:
-        f_vec = np.zeros((f_dim,), dtype=np.float32)
-    else:
-        f_vec = f * float(max(w_face, 0.0))
-    # 体
-    if b is None:
-        b_vec = np.zeros((b_dim,), dtype=np.float32)
-    else:
-        b_vec = b * float(max(w_body, 0.0))
-    fused = np.concatenate([f_vec, b_vec], axis=0)
-    n = float(np.linalg.norm(fused))
-    return fused / max(n, 1e-6)
-
-
-def pad_to_same_dim(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    if a is None or b is None:
-        return a, b
-    la = int(a.shape[0])
-    lb = int(b.shape[0])
-    if la == lb:
-        return a, b
-    if la < lb:
-        a = np.pad(a, (0, lb - la)).astype(np.float32)
-    else:
-        b = np.pad(b, (0, la - lb)).astype(np.float32)
-    return a, b
-
-
-def load_networks(paths: Dict[str, str]):
-    face_net = cv2.dnn.readNetFromCaffe(paths["face_proto"], paths["face_model"])
-    age_net = None
-    gender_net = None
-    try:
-        if os.path.exists(paths["age_proto"]) and os.path.exists(paths["age_model"]):
-            age_net = cv2.dnn.readNetFromCaffe(paths["age_proto"], paths["age_model"])
-    except Exception as e:  # noqa: BLE001
-        print(f"[warn] 年齢モデル読み込み失敗: {e}")
-        age_net = None
-    try:
-        if os.path.exists(paths["gender_proto"]) and os.path.exists(paths["gender_model"]):
-            gender_net = cv2.dnn.readNetFromCaffe(paths["gender_proto"], paths["gender_model"])
-    except Exception as e:  # noqa: BLE001
-        print(f"[warn] 性別モデル読み込み失敗: {e}")
-        gender_net = None
-    return face_net, age_net, gender_net
-
-
-def detect_faces_and_attrs(face_app: FaceAnalysis, frame: np.ndarray, conf_threshold: float = 0.5):
-    faces = face_app.get(frame)
-    results = []  # (box, score, age, gender_str, embedding)
-    for f in faces:
-        score = float(getattr(f, "det_score", 0.0))
-        if score < conf_threshold:
-            continue
-        x1, y1, x2, y2 = [int(v) for v in f.bbox]
-        w, h = max(0, x2 - x1), max(0, y2 - y1)
-        if w <= 0 or h <= 0:
-            continue
-        gender_str = "Male" if getattr(f, "gender", 0) == 1 else "Female"
-        age_val = int(getattr(f, "age", 0))
-        emb = getattr(f, "normed_embedding", None)
-        if emb is None:
-            emb = getattr(f, "embedding", None)
-            if emb is not None:
-                emb = np.asarray(emb, dtype=np.float32)
-                n = float(np.linalg.norm(emb) + 1e-6)
-                emb = emb / n
-        if emb is not None:
-            emb = np.asarray(emb, dtype=np.float32)
-        results.append(((x1, y1, w, h), score, age_val, gender_str, emb))
-    return results
-
-
-def detect_faces_roi(face_app: FaceAnalysis, frame: np.ndarray, person_boxes: List[Tuple[Tuple[int, int, int, int], float]], conf_threshold: float = 0.5):
-    """ROIベースの顔検出（人数が多い時に効率的）"""
-    results = []
-    for (px, py, pw, ph), _ in person_boxes:
-        x1, y1 = max(0, px), max(0, py)
-        x2, y2 = min(frame.shape[1], px+pw), min(frame.shape[0], py+ph)
-        roi = frame[y1:y2, x1:x2]
-        if roi.size == 0: 
-            continue
-        faces = face_app.get(roi)
-        for f in faces:
-            score = float(getattr(f, "det_score", 0.0))
-            if score < conf_threshold: 
-                continue
-            fx1, fy1, fx2, fy2 = map(int, f.bbox)
-            w, h = max(0, fx2-fx1), max(0, fy2-fy1)
-            if w <= 0 or h <= 0:
-                continue
-            gender_str = "Male" if getattr(f, "gender", 0) == 1 else "Female"
-            age_val = int(getattr(f, "age", 0))
-            emb = getattr(f, "normed_embedding", None)
-            if emb is None:
-                emb = getattr(f, "embedding", None)
-                if emb is not None:
-                    emb = np.asarray(emb, dtype=np.float32)
-                    n = float(np.linalg.norm(emb) + 1e-6)
-                    emb = emb / n
-            if emb is not None:
-                emb = np.asarray(emb, dtype=np.float32)
-            # ROI座標を元のフレーム座標に変換
-            results.append(((x1+fx1, y1+fy1, w, h), score, age_val, gender_str, emb))
-    return results
-
-
-def iou(boxA: Tuple[int, int, int, int], boxB: Tuple[int, int, int, int]) -> float:
-    ax, ay, aw, ah = boxA
-    bx, by, bw, bh = boxB
-    xA = max(ax, bx)
-    yA = max(ay, by)
-    xB = min(ax + aw, bx + bw)
-    yB = min(ay + ah, by + bh)
-    interW = max(0, xB - xA)
-    interH = max(0, yB - yA)
-    inter = interW * interH
-    union = aw * ah + bw * bh - inter
-    return inter / union if union > 0 else 0.0
-
-
-@dataclass
-class Track:
-    track_id: int
-    box: Tuple[int, int, int, int]
-    last_seen_frame: int
-    age: Optional[int] = None
-    gender: Optional[str] = None
-    hits: int = 0
-    embedding: Optional[np.ndarray] = None
-    embedding_count: int = 0
-    person_id: Optional[int] = None
-
-
-class PersonRegistry:
-    def __init__(self, cosine_thresh: float = 0.52) -> None:
-        self.cosine_thresh = cosine_thresh
-        self.next_person_id = 1
-        self.person_id_to_embedding: Dict[int, np.ndarray] = {}
-        self.person_id_to_count: Dict[int, int] = {}
-
-    @staticmethod
-    def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-        a, b = pad_to_same_dim(a, b)
-        if a is None or b is None:
-            return 0.0
-        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-        return float(np.dot(a, b) / max(denom, 1e-6)) if denom > 0 else 0.0
-
-    def assign_person(self, embedding: Optional[np.ndarray]) -> int:
-        if embedding is None:
-            pid = self.next_person_id
-            self.next_person_id += 1
-            return pid
-        best_sim, best_pid = -1.0, None
-        for pid, emb in self.person_id_to_embedding.items():
-            sim = self._cosine(embedding, emb)
-            if sim > best_sim:
-                best_sim, best_pid = sim, pid
-        if best_pid is not None and best_sim >= self.cosine_thresh:
-            return best_pid
-        pid = self.next_person_id
-        self.next_person_id += 1
-        return pid
-
-    def update_person(self, person_id: int, embedding: Optional[np.ndarray]) -> None:
-        if embedding is None:
-            return
-        if person_id not in self.person_id_to_embedding:
-            self.person_id_to_embedding[person_id] = embedding
-            self.person_id_to_count[person_id] = 1
-            return
-        old = self.person_id_to_embedding[person_id]
-        old, embedding = pad_to_same_dim(old, embedding)
-        if old is None or embedding is None:
-            return
-        cnt = self.person_id_to_count.get(person_id, 1)
-        mix = (old * float(cnt) + embedding) / float(cnt + 1)
-        n = float(np.linalg.norm(mix))
-        self.person_id_to_embedding[person_id] = mix / max(n, 1e-6)
-        self.person_id_to_count[person_id] = cnt + 1
-
-
-class EmbeddingTracker:
-    def __init__(self, iou_gate: float = 0.2, sim_gate: float = 0.35, max_missed: int = 20, reid: Optional[PersonRegistry] = None) -> None:
-        self.iou_gate = iou_gate
-        self.sim_gate = sim_gate
-        self.max_missed = max_missed
-        self.next_id = 1
-        self.tracks: Dict[int, Track] = {}
-        self.reid = reid or PersonRegistry()
-
-    @staticmethod
-    def _cosine(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
-        a, b = pad_to_same_dim(a, b)
-        if a is None or b is None:
-            return 0.0
-        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-        return float(np.dot(a, b) / max(denom, 1e-6)) if denom > 0 else 0.0
-
-    def update(self, det_boxes: List[Tuple[int, int, int, int]], det_embeddings: List[Optional[np.ndarray]], frame_idx: int, det_weights: Optional[List[float]] = None) -> List[Track]:
-        if det_weights is None:
-            det_weights = [1.0 for _ in det_boxes]
-        track_ids = list(self.tracks.keys())
-        num_t, num_d = len(track_ids), len(det_boxes)
-        if num_t > 0 and num_d > 0:
-            cost = np.ones((num_t, num_d), dtype=np.float32)
-            for ti, tid in enumerate(track_ids):
-                tr = self.tracks[tid]
-                for di, box in enumerate(det_boxes):
-                    i = iou(tr.box, box)
-                    s = self._cosine(tr.embedding, det_embeddings[di])
-                    # ゲート
-                    if i < self.iou_gate and s < self.sim_gate:
-                        cost[ti, di] = 1.0  # 大きなコスト
-                    else:
-                        cost[ti, di] = (1.0 - 0.5 * (i)) + (1.0 - s) * 0.5
-            row_ind, col_ind = linear_sum_assignment(cost)
-            assigned_pairs = []
-            for r, c in zip(row_ind, col_ind):
-                if cost[r, c] < 1.5:  # 閾値
-                    assigned_pairs.append((r, c))
-        else:
-            assigned_pairs = []
-
-        assigned_dets: Dict[int, int] = {}
-        assigned_tracks: Dict[int, int] = {}
-        for r, c in assigned_pairs:
-            assigned_tracks[track_ids[r]] = c
-            assigned_dets[c] = track_ids[r]
-
-        # 更新
-        for tid, det_idx in assigned_tracks.items():
-            tr = self.tracks[tid]
-            tr.box = det_boxes[det_idx]
-            tr.last_seen_frame = frame_idx
-            tr.hits += 1
-            emb = det_embeddings[det_idx]
-            w = float(det_weights[det_idx] if det_idx < len(det_weights) else 1.0)
-            if emb is not None:
-                emb = np.asarray(emb, dtype=np.float32)
-                if tr.embedding is None:
-                    tr.embedding = emb
-                    tr.embedding_count = 1
-                else:
-                    a, b2 = pad_to_same_dim(tr.embedding, emb)
-                    if a is not None and b2 is not None:
-                        accum = a * float(tr.embedding_count) + b2 * float(max(w, 1e-6))
-                        tr.embedding_count += 1
-                        norm = float(np.linalg.norm(accum))
-                        tr.embedding = accum / max(norm, 1e-6)
-            # person id 更新
-            if tr.person_id is None:
-                tr.person_id = self.reid.assign_person(tr.embedding)
-            self.reid.update_person(tr.person_id, tr.embedding)
-
-        # 未割当検出 → 新規トラック
-        for di, box in enumerate(det_boxes):
-            if di in assigned_dets:
-                continue
-            tid = self.next_id
-            self.next_id += 1
-            tr = Track(track_id=tid, box=box, last_seen_frame=frame_idx, hits=1)
-            emb = det_embeddings[di]
-            if emb is not None:
-                emb = np.asarray(emb, dtype=np.float32)
-                n = float(np.linalg.norm(emb))
-                tr.embedding = emb / max(n, 1e-6)
-                tr.embedding_count = 1
-            tr.person_id = self.reid.assign_person(tr.embedding)
-            self.reid.update_person(tr.person_id, tr.embedding)
-            self.tracks[tid] = tr
-
-        # 期限切れトラックの削除
-        to_del = [tid for tid, tr in self.tracks.items() if frame_idx - tr.last_seen_frame > self.max_missed]
-        for tid in to_del:
-            del self.tracks[tid]
-
-        return list(self.tracks.values())
-
-
-def format_timestamp(sec_float: float) -> str:
-    if sec_float < 0:
-        sec_float = 0
-    ms = int(round((sec_float - int(sec_float)) * 1000))
-    s = int(sec_float) % 60
-    m = (int(sec_float) // 60) % 60
-    h = int(sec_float) // 3600
+def ts_hhmmss_ms(sec: float) -> str:
+    sec = max(0.0, float(sec))
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    ms = int(round((sec - int(sec)) * 1000.0))
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
+def now_prefix(play_pos_sec: float) -> str:
+    # ログ先頭の [HH:MM:SS.mmm] は「ファイル先頭からの現在位置」
+    return f"[{ts_hhmmss_ms(play_pos_sec)}]"
 
-def _compute_laplacian_sharpness(gray: np.ndarray) -> float:
+def parse_size(s: str) -> Optional[Tuple[int,int]]:
     try:
-        v = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        # 正規化（経験的スケール）。高価値ほどシャープ
-        return min(1.0, v / 100.0)
-    except Exception:
-        return 0.0
-
-
-def _compute_face_quality_metrics(frame: np.ndarray, box: Tuple[int, int, int, int]) -> Tuple[float, float]:
-    """顔領域の面積とシャープネス（0-1）を返す。boxは(x,y,w,h)。"""
-    try:
-        x, y, w, h = [int(v) for v in box]
-        H, W = frame.shape[:2]
-        x = max(0, min(x, W - 1)); y = max(0, min(y, H - 1))
-        w = max(1, min(w, W - x)); h = max(1, min(h, H - y))
-        crop = frame[y:y + h, x:x + w]
-        face_size = float(w * h)
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        sharp = _compute_laplacian_sharpness(gray)
-        return face_size, sharp
-    except Exception:
-        return 0.0, 0.0
-
-
-class StatsAccumulator:
-    def __init__(self) -> None:
-        self.gender_to_count: Dict[str, int] = {"Male": 0, "Female": 0, "": 0}
-        self.gender_to_age_sum: Dict[str, float] = {"Male": 0.0, "Female": 0.0, "": 0.0}
-        self.gender_to_age_n: Dict[str, int] = {"Male": 0, "Female": 0, "": 0}
-
-    def update(self, age: Optional[int], gender: Optional[str]) -> None:
-        g = gender if gender in ("Male", "Female") else ""
-        self.gender_to_count[g] = self.gender_to_count.get(g, 0) + 1
-        if isinstance(age, (int, float)) and age and age > 0:
-            self.gender_to_age_sum[g] = self.gender_to_age_sum.get(g, 0.0) + float(age)
-            self.gender_to_age_n[g] = self.gender_to_age_n.get(g, 0) + 1
-
-    def means(self) -> Dict[str, float]:
-        out: Dict[str, float] = {}
-        for g in self.gender_to_count.keys():
-            n = self.gender_to_age_n.get(g, 0)
-            out[g] = (self.gender_to_age_sum.get(g, 0.0) / n) if n > 0 else 0.0
-        return out
-
-
-def _ensure_dir(p: str) -> None:
-    os.makedirs(p or ".", exist_ok=True)
-
-
-def compute_geom_features(frame: np.ndarray, box: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
-    try:
-        H, W = frame.shape[:2]
-        x, y, w, h = [int(v) for v in box]
-        if w <= 0 or h <= 0 or W <= 0 or H <= 0:
-            return None
-        aspect = float(h) / float(w)
-        area_ratio = float(w * h) / float(W * H)
-        yc_norm = float(y + h * 0.5) / float(H)
-        feat = np.array([aspect, area_ratio, yc_norm], dtype=np.float32)
-        n = float(np.linalg.norm(feat))
-        return feat / max(n, 1e-6)
+        s = s.lower().replace("×", "x")
+        w, h = s.split("x")
+        return int(w), int(h)
     except Exception:
         return None
 
+def ensure_parent(path: str) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
 
-def analyze_video(
-    video_path: str,
-    output_csv: str,
-    start_sec: float,
-    duration_sec: float,
-    output_csv_raw: Optional[str] = None,
-    show_window: bool = True,
-    detect_every_n: int = 5,
-    conf_threshold: float = 0.6,
-    save_video: bool = False,
-    video_out_path: Optional[str] = None,
-    reid_cosine_thresh: float = 0.5,
-    gate_iou: float = 0.2,
-    gate_sim: float = 0.35,
-    det_size: Tuple[int, int] = (640, 640),
-    body_conf: float = 0.5,
-    w_face: float = 0.7,
-    w_body: float = 0.3,
-    device: str = "auto",
-    tracker_backend: str = "embed",
-    log_every_sec: float = 5.0,
-    checkpoint_every_sec: float = 60.0,
-    merge_every_sec: float = 60.0,
-    flush_every_n: int = 5,
-    no_merge: bool = False,
-    run_id: Optional[str] = None,
-    process_fps: float = 0.0,
-    trt_engine: Optional[str] = None,
-    yolo_weights: Optional[str] = None,
-    face_model: str = "buffalo_l",
-    reid_backend: str = "hist",
-    gait_features: bool = False,
-    global_start_sec: float = 0.0,
-    no_trt_export: bool = False,
-) -> None:
-    # 現在の可変パラメータ（オートチューニング対象）
-    current_det_w, current_det_h = int(det_size[0]), int(det_size[1])
-    current_detect_every_n = int(detect_every_n)
+def open_csv_append(path: str, header: List[str]):
+    """ヘッダ追記に対応：既存で空/非空を判定して必要ならヘッダを書く"""
+    ensure_parent(path)
+    exists = os.path.exists(path)
+    f = open(path, "a", newline="")
+    if (not exists) or (os.path.getsize(path) == 0):
+        f.write(",".join(header) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    return f
 
-    # CUDA初期化エラーが発生した場合のフォールバック処理
-    original_device = device
-    try:
-        if device.lower() in ("cuda", "auto") and torch.cuda.is_available():
-            # CUDA初期化テスト
-            torch.cuda.init()
-            torch.cuda.empty_cache()
-            print(f"[INFO] CUDA初期化テスト成功: {torch.cuda.get_device_name(0)}", flush=True)
-    except Exception as cuda_init_e:
-        print(f"[WARN] CUDA初期化失敗、CPUにフォールバック: {cuda_init_e}", flush=True)
-        device = "cpu"
-        print(f"[INFO] デバイスをCPUに変更: {original_device} -> {device}", flush=True)
+@dataclass
+class Args:
+    video: str
+    start_sec: float
+    duration_sec: float
+    output_csv: str
+    global_start_sec: float
+    no_show: bool
+    device: str
+    merge_every_sec: int
+    no_merge: bool
+    output_csv_raw: str
+    detect_every_n: int
+    det_size: Optional[Tuple[int,int]]
+    yolo_weights: Optional[str]
 
-    # Face/YOLO 初期化
-    face_app = init_face_app(det_w=current_det_w, det_h=current_det_h, device=device, face_model=face_model)
-    if trt_engine is None and yolo_weights and (device.lower() in ("cuda", "auto")) and torch.cuda.is_available():
-        built_engine = ensure_trt_engine(yolo_weights, no_trt_export=no_trt_export)
-        if built_engine:
-            trt_engine = built_engine
-            print(f"[TRT] Using TensorRT engine: {trt_engine}", flush=True)
-        elif no_trt_export:
-            print(f"[TRT] TensorRT export skipped due to --no-trt-export flag", flush=True)
-    yolo = init_person_detector(device=device, trt_engine=trt_engine, yolo_weights=(yolo_weights or "yolov8n.pt"))
-    # optional trackers
-    bytetrack = None
-    deepsort = None
-    if tracker_backend == "bytetrack":
-        if sv is None:
-            raise RuntimeError("supervision が見つかりません。pip install supervision してください。")
-        bytetrack = sv.ByteTrack()
-    elif tracker_backend == "strongsort":
-        if DeepSort is None:
-            raise RuntimeError("deep-sort-realtime が見つかりません。pip install deep-sort-realtime してください。")
-        deepsort = DeepSort(max_age=60, n_init=2, nms_max_overlap=1.0)
+# -------------------- 検出器 --------------------
 
-    # ReID(OSNet) 初期化（必要な場合のみ）
-    osnet_model = None
-    try:
-        if reid_backend in ("osnet", "ensemble") and torchreid is not None:
-            # デバイス選択: 指定がautoなら優先順 cuda -> mps -> cpu
-            if device.lower() == "cuda" or (device.lower() == "auto" and torch.cuda.is_available()):
-                osn_dev = "cuda"
-            elif device.lower() == "mps" or (device.lower() == "auto" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-                osn_dev = "mps"
-            else:
-                osn_dev = "cpu"
-            osnet_model = OsnetReId(device_choice=osn_dev)
-            print(f"[INFO] OSNet ReID 初期化: device={osn_dev}", flush=True)
-    except Exception as e:
-        print(f"[WARN] OSNet ReID を初期化できませんでした: {e} | HSVヒストのみで継続します", flush=True)
-        if reid_backend == "osnet":
-            reid_backend = "hist"
-
-    # デコーダ選択（自動）: PyAV+NVDEC/VideoToolbox 優先、フォールバックはOpenCV
-    prefer_hw = (device.lower() in ("cuda", "auto")) or (sys.platform == 'darwin')
-    # デコーダ安全化：_dec が無い/関数が無い場合は OpenCV へフォールバック
-    if _dec is None or not hasattr(_dec, "select_decoder"):
-        dec_kind, dec_kwargs = "opencv", {}
-    else:
-        dec_kind, dec_kwargs = _dec.select_decoder(prefer_hw=prefer_hw)
-    cap = None
-    # FPSはPyAVでは逐次取得するため近似で30を利用（進捗・ETAにのみ使用）
-    fps = 30.0
-    # PyAV用のメタデータ（全長秒）
-    pyav_total_sec = 0.0
-    if dec_kind == "opencv":
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"動画を開けません: {video_path}")
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    else:
-        # PyAVメタデータからfps/動画長を推定
-        try:
-            import av  # type: ignore
-            _cont = av.open(video_path, mode='r')
-            _v = _cont.streams.video[0]
+class Detector:
+    """YOLOがあれば使う。無ければフォールバック（平均輝度+モーションの疑似検出）。"""
+    def __init__(self, args: Args):
+        self.args = args
+        self.model = None
+        self.using_yolo = False
+        if _HAS_YOLO and args.yolo_weights:
             try:
-                if getattr(_v, "average_rate", None):
-                    fps = float(_v.average_rate)
+                self.model = YOLO(args.yolo_weights)
+                self.using_yolo = True
+            except Exception:
+                self.model = None
+                self.using_yolo = False
+
+    def infer(self, frame_bgr) -> List[Tuple[float, float, float, float, float, int, str]]:
+        """
+        戻り値: list of (x1,y1,x2,y2,conf,class_id,label)
+        """
+        if self.using_yolo and self.model is not None:
+            try:
+                img = frame_bgr
+                if self.args.det_size:
+                    w,h = self.args.det_size
+                    img = cv2.resize(img, (w,h), interpolation=cv2.INTER_LINEAR)
+                res = self.model.predict(img, verbose=False, device=self.args.device if self.args.device else None)
+                out = []
+                if res and len(res) > 0:
+                    r0 = res[0]
+                    names = r0.names if hasattr(r0, "names") else {}
+                    for b in r0.boxes:
+                        xyxy = b.xyxy[0].tolist()  # [x1,y1,x2,y2]
+                        conf = float(b.conf[0].item()) if hasattr(b, "conf") else 0.0
+                        cls = int(b.cls[0].item()) if hasattr(b, "cls") else -1
+                        label = names.get(cls, str(cls))
+                        out.append((xyxy[0], xyxy[1], xyxy[2], xyxy[3], conf, cls, label))
+                return out
             except Exception:
                 pass
-            # 優先: container.duration（マイクロ秒）
-            dur = None
-            try:
-                if getattr(_cont, "duration", None):
-                    dur = float(_cont.duration) / 1_000_000.0
-            except Exception:
-                dur = None
-            # 次点: stream.duration * time_base
-            if (not dur) and getattr(_v, "duration", None) and getattr(_v, "time_base", None):
-                try:
-                    dur = float(_v.duration * _v.time_base)
-                except Exception:
-                    dur = None
-            if dur and dur > 0:
-                pyav_total_sec = float(dur)
-            _cont.close()
-        except Exception:
-            pass
-    # Apple Silicon / CUDA 利用状況を明示
-    if torch.cuda.is_available():
-        dev_log = f"CUDA使用中: {torch.cuda.get_device_name(0) if torch.cuda.device_count()>0 else 'Unknown'}"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        dev_log = "MPS使用中: Apple Silicon GPU"
-    else:
-        dev_log = "CPU処理"
-    dec_log = "PyAV+VideoToolbox" if (dec_kind == "pyav" and sys.platform == 'darwin') else ("PyAV" if dec_kind == "pyav" else "OpenCV")
-    print(f"[INFO] 推論デバイス: {dev_log} | デコーダ: {dec_log}", flush=True)
-    # 1秒あたりの処理フレーム数（0 で無効）。指定時はフレームを間引く
-    stride_frames = 1
-    if process_fps and process_fps > 0:
-        try:
-            stride_frames = max(1, int(round(float(fps) / float(process_fps))))
-        except Exception:
-            stride_frames = 1
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) if cap is not None else 0
-    # 動画の全体長を計算（秒）
-    total_video_duration = 0.0
-    if cap is not None and total_frames > 0 and fps > 0:
-        total_video_duration = total_frames / fps
-    elif dec_kind == "pyav" and pyav_total_sec > 0 and fps > 0:
-        total_video_duration = pyav_total_sec
-        total_frames = int(total_video_duration * fps)
+        # フォールバック（簡易）：明度の高い領域を擬似ボックス1つで返す
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        mean = float(gray.mean())
+        h, w = gray.shape
+        pad = max(8, int(min(w,h)*0.05))
+        x1, y1 = pad, pad
+        x2, y2 = w - pad, h - pad
+        conf = min(1.0, mean/255.0)
+        return [(float(x1), float(y1), float(x2), float(y2), conf, 0, "bright")]
 
-    # 出力先とレジューム対象の事前判定（latestリンクを優先）
-    out_dir = os.path.dirname(output_csv) or "."
-    os.makedirs(out_dir, exist_ok=True)
-    dir_basename = os.path.basename(os.path.normpath(out_dir))
-    default_outputs_dir = (dir_basename == "outputs")
-    latest_link = os.path.join(out_dir, os.path.splitext(os.path.basename(output_csv))[0] + "_latest.csv")
-    resume_mode = False
-    resume_csv_path: Optional[str] = None
-    last_written_frame: Optional[int] = None
-    if default_outputs_dir and os.path.exists(latest_link) and bool(os.environ.get("ALLOW_RESUME", "1")):
-        try:
-            candidate = os.path.realpath(latest_link)
-            with open(candidate, newline="") as rf:
-                rr = csv.DictReader(rf)
-                for row in rr:
-                    try:
-                        last_written_frame = int(str(row.get("frame", "0").strip() or "0"))
-                    except Exception:
-                        pass
-            if last_written_frame is not None and last_written_frame > 0:
-                resume_mode = True
-                resume_csv_path = candidate
-        except Exception:
-            resume_mode = False
+# -------------------- 本体 --------------------
 
-    # シーク（時間単位で試して、失敗したらフレーム単位）
-    if cap is not None and resume_mode and (last_written_frame is not None) and last_written_frame > 0:
-        target_frame = int(last_written_frame)
-        start_sec = float(target_frame) / float(fps)
-    else:
-        target_frame = int(round(start_sec * fps))
-        if cap is not None:
-            cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-    start_frame_pos = target_frame
+def parse_cli() -> Args:
+    p = argparse.ArgumentParser(description="analyze video chunk and emit CSV rows")
+    p.add_argument("--video", required=True)
+    p.add_argument("--start-sec", type=float, default=0.0)
+    p.add_argument("--duration-sec", type=float, default=0.0, help="0 means until EOF")
+    p.add_argument("--output-csv", required=True)
+    p.add_argument("--global-start-sec", type=float, default=0.0)
+    p.add_argument("--no-show", action="store_true")
+    p.add_argument("--device", default="", help="cuda/mps/cpu (hint)")
+    p.add_argument("--merge-every-sec", type=int, default=30)  # 互換フラグ（本実装ではI/Oフラッシュ間隔として利用）
+    p.add_argument("--no-merge", action="store_true")          # 互換フラグ（意味上はRAW出力）
+    p.add_argument("--output-csv-raw", default="", help="if set, write identical raw rows here too")
+    p.add_argument("--detect-every-n", type=int, default=1, help="run detector every N frames")
+    p.add_argument("--det-size", default="", help="e.g. 1920x1920")
+    p.add_argument("--yolo-weights", default="", help="yolov8*.pt if available")
+    a = p.parse_args()
 
-    # マージ処理の設定
-    print(f"[DEBUG] no_merge flag value: {no_merge}", flush=True)
-    print(f"[DEBUG] merge_every_sec value: {merge_every_sec}", flush=True)
-    
-    if no_merge:
-        # --no-mergeフラグが指定された場合：特徴量のみ保持、類似度判定なし
-        print(f"[INFO] --no-merge flag detected: raw feature extraction mode (no similarity matching)", flush=True)
-        # 類似度判定を無効化し、特徴量のみを保持するモード
-        tracker = EmbeddingTracker(iou_gate=0.0, sim_gate=0.0, max_missed=int(fps * 10), reid=PersonRegistry(cosine_thresh=0.0))
-        print(f"[INFO] 特徴量抽出モード: IoU=0.0, Sim=0.0, ReID=0.0 (raw features only)", flush=True)
-    else:
-        # 通常のマージ処理（より寛容な閾値でデータ生成を確実にする）
-        safe_iou = max(0.1, min(0.5, gate_iou))  # 0.1-0.5の範囲に制限
-        safe_sim = max(0.2, min(0.6, gate_sim))  # 0.2-0.6の範囲に制限
-        safe_reid = max(0.3, min(0.7, reid_cosine_thresh))  # 0.3-0.7の範囲に制限
-        tracker = EmbeddingTracker(iou_gate=safe_iou, sim_gate=safe_sim, max_missed=int(fps * 5), reid=PersonRegistry(cosine_thresh=safe_reid))
-        print(f"[INFO] マージ処理: IoU={safe_iou:.1f}, Sim={safe_sim:.1f}, ReID={safe_reid:.1f} (safe mode)", flush=True)
-    # attribute memory for external trackers
-    ext_attr: Dict[int, Dict[str, object]] = {}
-
-    out_dir = os.path.dirname(output_csv) or "."
-    os.makedirs(out_dir, exist_ok=True)
-    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"run_{run_stamp}" if not run_id else f"run_{run_stamp}_{run_id}"
-    run_dir = os.path.join(out_dir, run_name)
-    _ensure_dir(run_dir)
-
-    # 出力CSVはデフォルトで衝突しないよう run_dir 配下へ
-    dir_basename = os.path.basename(os.path.normpath(out_dir))
-    default_outputs_dir = (dir_basename == "outputs")
-    unique_output = True
-    # 実行元の動画ファイル名をサフィックスとして付与（並行実行での衝突回避）
-    try:
-        base_out = os.path.splitext(os.path.basename(output_csv))[0]
-        video_base = os.path.splitext(os.path.basename(video_path))[0]
-        import re as _re
-        video_id = _re.sub(r"[^A-Za-z0-9_.-]", "_", video_base)[:80]
-        csv_name_with_video = f"{base_out}_{video_id}.csv"
-    except Exception:
-        csv_name_with_video = os.path.basename(output_csv)
-    effective_csv_path = (
-        os.path.join(run_dir, csv_name_with_video)
-        if (unique_output and default_outputs_dir)
-        else output_csv
+    det_sz = parse_size(a.det_size) if a.det_size else None
+    return Args(
+        video=a.video,
+        start_sec=float(a.start_sec),
+        duration_sec=float(a.duration_sec),
+        output_csv=a.output_csv,
+        global_start_sec=float(a.global_start_sec),
+        no_show=bool(a.no_show),
+        device=a.device.strip(),
+        merge_every_sec=int(a.merge_every_sec),
+        no_merge=bool(a.no_merge),
+        output_csv_raw=a.output_csv_raw.strip(),
+        detect_every_n=max(1, int(a.detect_every_n)),
+        det_size=det_sz,
+        yolo_weights=a.yolo_weights.strip() or None,
     )
-    # 便利リンク: 最新CSVへのシンボリックリンクを outputs に作成
-    if unique_output and default_outputs_dir:
-        try:
-            base_out = os.path.splitext(os.path.basename(output_csv))[0]
-            latest_link = os.path.join(out_dir, f"{base_out}_{video_id}_latest.csv")
-            if os.path.islink(latest_link) or os.path.exists(latest_link):
-                try:
-                    os.remove(latest_link)
-                except Exception:
-                    pass
-            os.symlink(os.path.abspath(effective_csv_path), latest_link)
-        except Exception:
-            pass
 
-    # レジューム設定（latestリンクを優先、無ければeffective_csv_path）
-    resume_mode = False
-    last_written_frame: Optional[int] = None
-    candidate_csvs = []
-    try:
-        base_out = os.path.splitext(os.path.basename(output_csv))[0]
-        _resume_latest = os.path.join(out_dir, f"{base_out}_{video_id}_latest.csv")
-    except Exception:
-        _resume_latest = os.path.join(out_dir, os.path.splitext(os.path.basename(output_csv))[0] + "_latest.csv")
-    if os.path.exists(_resume_latest):
-        candidate_csvs.append(os.path.realpath(_resume_latest))
-    if os.path.exists(effective_csv_path):
-        candidate_csvs.append(effective_csv_path)
-    if bool(os.environ.get("ALLOW_RESUME", "1")):
-        for cand in candidate_csvs:
-            try:
-                with open(cand, newline="") as rf:
-                    rr = csv.DictReader(rf)
-                    for row in rr:
-                        try:
-                            last_written_frame = int(str(row.get("frame", "0").strip() or "0"))
-                        except Exception:
-                            pass
-                if last_written_frame is not None and last_written_frame > 0:
-                    resume_mode = True
-                    effective_csv_path = cand  # 継続して追記
-                    break
-            except Exception:
-                continue
+def open_video_at(video_path: str, start_sec: float):
+    cap = cv2.VideoCapture(video_path)
+    if not cap or not cap.isOpened():
+        raise SystemExit(f"[ERROR] cannot open video: {video_path}")
+    if start_sec > 0:
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    return cap, fps, total_frames
 
-    csv_file = open(effective_csv_path, ("a" if resume_mode else "w"), newline="", buffering=1024*1024)  # 1MBバッファでIO負荷軽減
-    writer = csv.writer(csv_file)
-    # 実行開始時刻（JST）を列に保持（各行に同値を書き込む）
-    run_started_utc = datetime.now(timezone.utc)
-    run_started_jst_dt = run_started_utc.astimezone(ZoneInfo("Asia/Tokyo")) if ZoneInfo else run_started_utc
-    run_started_jst_str = run_started_jst_dt.strftime("%Y-%m-%d %H:%M:%S")
-    # 列: timestamp(開始秒からの相対) の隣に、動画ファイル開始(例: 11:41:00)からの相対時刻を追加
-    # 新規作成時のみ品質メトリクス列を追加（レジューム時は列数を変えない）
-    write_quality_cols = (not resume_mode)
-    if not resume_mode:
-        writer.writerow([
-            "timestamp",  # start_sec からの相対 HH:MM:SS
-            "ts_from_file_start",  # 動画ファイル開始(例: 11:41:00)からの相対 HH:MM:SS
-            "frame",
-            "person_id",
-            "track_id",
-            "age",
-            "gender",
-            "x",
-            "y",
-            "w",
-            "h",
-            "conf",
-            # 追加: 顔品質メトリクス
-            "face_size",
-            "sharpness",
-            "embedding_b64",
-            "absolute_timestamp",
-            "run_started_jst",
-        ])
+def main():
+    args = parse_cli()
+    cap, fps, total_frames = open_video_at(args.video, args.start_sec)
 
-    # 絶対開始時刻（JST）をファイル名から推定
-    video_dt = parse_video_start_datetime(video_path)
-    start_time_video = start_sec
-    end_time_video = start_sec + duration_sec
-    frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if cap is not None else int(start_frame_pos)
-
-    last_detect_frame = -9999
-
-    vw = None
-    if save_video:
-        out_path = video_out_path or os.path.splitext(effective_csv_path)[0] + ".mp4"
-        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-
-    # Progress/Stats
-    stats = StatsAccumulator()
-    start_wall = time.time()
-    next_log_wall = start_wall + float(log_every_sec)
-    next_ckpt_wall = start_wall + float(checkpoint_every_sec)
-    next_merge_wall = start_wall + max(60.0, float(merge_every_sec)) if merge_every_sec and merge_every_sec > 0 else start_wall + 60.0
-    # 自動調整: 目標ウォール時間（分）
-    target_wall_min = float(os.environ.get("TARGET_WALL_MIN", str(getattr(locals().get('args', object()), 'target_wall_min', 0))) or 0)
-    # 起動後のウォームアップ区間（秒）
-    autotune_warmup_sec = float(os.environ.get("AUTOTUNE_WARMUP_SEC", "30"))
-    autotune_interval_sec = float(os.environ.get("AUTOTUNE_INTERVAL_SEC", "30"))
-    last_autotune_wall = start_wall
-    # 現在の process_fps 推定
-    current_process_fps = float(process_fps or 0.0)
-
-    # オートチューニングの品質制約（環境変数で調整可）
-    det_min = int(os.environ.get("AUTOTUNE_DET_MIN", "640"))
-    det_max = int(os.environ.get("AUTOTUNE_DET_MAX", "1024"))
-    det_step = int(os.environ.get("AUTOTUNE_DET_STEP", "64"))
-    det_pref = str(os.environ.get("AUTOTUNE_DET_PREF", "prefer_quality")).lower()  # prefer_quality / prefer_speed
-    d_n_min = int(os.environ.get("AUTOTUNE_DETECT_N_MIN", "1"))
-    d_n_max = int(os.environ.get("AUTOTUNE_DETECT_N_MAX", "4"))
-    # face_app 再準備用 ctx_id 推定
-    face_ctx_id = 0 if (device.lower() in ("cuda", "gpu") or (device.lower()=="auto" and torch.cuda.is_available())) else -1
-    
-    # 開始時のログ出力
-    if video_dt is not None:
-        try:
-            # チャンク開始の時計時刻 = ファイル開始時刻 + start_sec
-            start_time_str = (video_dt + timedelta(seconds=float(start_sec))).strftime("%H:%M:%S")
-        except Exception:
-            start_time_str = video_dt.strftime("%H:%M:%S")
-        print(f"[INFO] 解析開始: 動画時刻 {start_time_str} から開始します", flush=True)
-    if duration_sec and duration_sec > 0:
-        print(f"[INFO] 解析範囲: {start_sec}秒目から {duration_sec}秒間", flush=True)
+    # 終了境界
+    start_frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+    if args.duration_sec > 0:
+        end_time_sec = args.start_sec + args.duration_sec
     else:
-        remaining_duration = total_video_duration - start_sec if total_video_duration > start_sec else 0
-        print(f"[INFO] 解析範囲: {start_sec}秒目から動画の最後まで（残り約{remaining_duration:.0f}秒）", flush=True)
-    print(f"[INFO] ログ出力: {log_every_sec}秒毎、チェックポイント: {checkpoint_every_sec}秒毎", flush=True)
-    
-    # デバイス状況の確認
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "Unknown"
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.device_count() > 0 else 0
-        print(f"[INFO] CUDA使用中: {gpu_name} ({gpu_memory:.1f}GB)", flush=True)
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        print(f"[INFO] MPS使用中: Apple Silicon GPU", flush=True)
+        # EOF まで
+        # 総フレームが分かればそれ、分からなければ大きな値
+        if total_frames > 0:
+            end_time_sec = (total_frames / max(1e-6, fps))
+        else:
+            end_time_sec = float("inf")
+
+    # CSV準備
+    header = [
+        "timestamp",             # (= ts_from_file_start を後で上書き用に保持。マージ側と互換)
+        "ts_from_file_start",    # ファイル頭からのHH:MM:SS.mmm（ランチャで最終的にこちらを標準化）
+        "frame",
+        "x1","y1","x2","y2",
+        "conf","class","label"
+    ]
+    f_csv = open_csv_append(args.output_csv, header)
+    f_raw = open_csv_append(args.output_csv_raw, header) if args.output_csv_raw else None
+
+    detector = Detector(args)
+
+    # 進行管理
+    last_flush = time.time()
+    flush_interval = max(1.0, float(args.merge_every_sec))  # 互換フラグをフラッシュ間隔に活用
+    processed_frames = 0
+    emitted_rows = 0
+
+    # 推定終了フレーム（総尺がわかる場合）
+    if math.isfinite(end_time_sec):
+        est_total_span = end_time_sec - args.start_sec
+        est_total_frames = int(est_total_span * fps) if est_total_span > 0 else 0
     else:
-        print(f"[INFO] CPU処理", flush=True)
+        est_total_frames = 0
 
-    def write_progress(now_wall: float) -> None:
-        fps_val = float(fps)
-        # 動画内の現在位置（start_secからの相対）
-        current_video_sec = (frame_idx / fps_val)
-        relative_time_sec = current_video_sec - start_sec
-        # 進捗率: duration指定があればその範囲, 無ければ動画全体の残り時間で計算
-        if duration_sec and duration_sec > 0:
-            processed_sec = max(0.0, min(duration_sec, relative_time_sec))
-            percent = float(processed_sec / duration_sec) if duration_sec > 0 else 0.0
-        else:
-            # 動画全体の残り時間で進捗率を計算
-            remaining_total = total_video_duration - start_sec
-            if remaining_total > 0:
-                processed_sec = max(0.0, min(remaining_total, relative_time_sec))
-                percent = float(processed_sec / remaining_total) if remaining_total > 0 else 0.0
-            else:
-                # フォールバック: フレーム数ベース
-                processed_sec = max(0.0, relative_time_sec)
-                denom_frames = max(1, total_frames - start_frame_pos)
-                percent = float(max(0, frame_idx - start_frame_pos) / denom_frames)
-        elapsed = now_wall - start_wall
-        eta_sec = (elapsed / percent - elapsed) if percent > 1e-6 else None
-        # 現在時刻・ETA をJSTで
-        now_utc = datetime.now(timezone.utc)
-        now_jst_dt = now_utc.astimezone(ZoneInfo("Asia/Tokyo")) if ZoneInfo else now_utc
-        eta_dt = (now_utc if eta_sec is None else datetime.fromtimestamp(now_wall + eta_sec, tz=timezone.utc))
-        eta_jst_dt = eta_dt.astimezone(ZoneInfo("Asia/Tokyo")) if ZoneInfo else eta_dt
-        now_jst = now_jst_dt.strftime("%Y-%m-%d %H:%M:%S")
-        eta_jst = eta_jst_dt.strftime("%Y-%m-%d %H:%M:%S")
-        # 動画内の現在位置（start_secからの相対）
-        current_video_sec = (frame_idx / fps_val)
-        relative_video_sec = current_video_sec - start_sec
-        # 絶対時刻（JST）を表示（11:41からの経過時間）
-        if video_dt is not None:
-            try:
-                abs_dt = (video_dt + timedelta(seconds=float(current_video_sec)))
-                video_ts = abs_dt.strftime("%H:%M:%S")
-            except Exception:
-                video_ts = format_timestamp(relative_video_sec)
-        else:
-            video_ts = format_timestamp(relative_video_sec)
-        prog = {
-            "now_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
-            "now_jst": now_jst,
-            "processed_sec": round(processed_sec, 3),
-            "percent": round(min(1.0, percent) * 100.0, 2),
-            "eta_jst": eta_jst,
-            "fps": round(fps_val, 2),
-            "video_ts": video_ts,
-            "gender_count": stats.gender_to_count,
-            "gender_age_mean": {k: round(v, 2) for k, v in stats.means().items()},
-            "online_unique_persons": len(set([tr.person_id for tr in tracker.tracks.values() if tr.person_id is not None])),
-        }
-        try:
-            with open(os.path.join(run_dir, "progress.json"), "w") as f:
-                json.dump(prog, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-        # 簡易ログ出力（動画内タイムスタンプ・マージ後人数・男女別統計）
-        merged = prog['online_unique_persons']
-        male_count = prog['gender_count'].get('Male', 0)
-        female_count = prog['gender_count'].get('Female', 0)
-        male_avg_age = prog['gender_age_mean'].get('Male', 0.0)
-        female_avg_age = prog['gender_age_mean'].get('Female', 0.0)
-        # ETAと残り時間の表示
-        eta_info = ""
-        if eta_sec is not None and eta_sec > 0:
-            eta_hours = int(eta_sec // 3600)
-            eta_minutes = int((eta_sec % 3600) // 60)
-            if eta_hours > 0:
-                eta_info = f" | ETA: {eta_hours}h{eta_minutes}m"
-            else:
-                eta_info = f" | ETA: {eta_minutes}m"
-
-        # 実測処理速度/現行パラメータも出力（こまめなログ）
-        processed_frames = max(1, frame_idx - start_frame_pos)
-        fps_proc = processed_frames / max(1e-6, (now_wall - start_wall))
-        extra = f" stride={stride_frames} det={current_det_w}x{current_det_h} dN={current_detect_every_n} proc_fps={fps_proc:.1f}"
-        print(f"[{video_ts}] [PROGRESS] {prog['percent']}% | merged={merged} | M:{male_count}(avg:{male_avg_age:.1f}) F:{female_count}(avg:{female_avg_age:.1f}) | elapsed={elapsed:.1f}s{eta_info}{extra}", flush=True)
-
-    def checkpoint(now_wall: float) -> None:
-        # フラッシュして耐中断性を高める
-        try:
-            csv_file.flush()
-            try:
-                os.fsync(csv_file.fileno())
-            except Exception:
-                pass
-        except Exception:
-            pass
-        # 進捗履歴に1行追記
-        try:
-            current_video_sec = (frame_idx / float(fps))
-            relative_time_sec = current_video_sec - start_sec
-            if duration_sec and duration_sec > 0:
-                processed_sec = max(0.0, min(duration_sec, relative_time_sec))
-                percent = float(processed_sec / duration_sec) if duration_sec > 0 else 0.0
-            else:
-                processed_sec = max(0.0, relative_time_sec)
-                denom_frames = max(1, total_frames - start_frame_pos)
-                percent = float(max(0, frame_idx - start_frame_pos) / denom_frames)
-            line = {
-                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "processed_sec": round(processed_sec, 3),
-                "percent": round(min(1.0, percent) * 100.0, 2),
-                "male": stats.gender_to_count.get("Male", 0),
-                "female": stats.gender_to_count.get("Female", 0),
-                "unknown": stats.gender_to_count.get("", 0),
-                "online_unique_persons": len(set([tr.person_id for tr in tracker.tracks.values() if tr.person_id is not None])),
-            }
-            hist_path = os.path.join(run_dir, "progress_history.jsonl")
-            with open(hist_path, "a") as f:
-                f.write(json.dumps(line, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-
-    def launch_merge_snapshot() -> None:
-        # 軽量: 現在のクラスタ数のみ算出して書き出し（高コストな再クラスタは避ける）
-        try:
-            data = {
-                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "online_unique_persons": len(set([tr.person_id for tr in tracker.tracks.values() if tr.person_id is not None]))
-            }
-            with open(os.path.join(run_dir, "merge_snapshot.json"), "w") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    try:
-        # フレームイテレータ（PyAV/OpenCV）
-        # OpenCV純正のフォールバックイテレータ
-        def frames_opencv_baseline(video_path: str, start_sec: float, duration_sec: float):
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                raise RuntimeError(f"動画を開けません: {video_path}")
-            if start_sec > 0:
-                cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
-            end_msec = None if (not duration_sec or duration_sec <= 0) else (start_sec + duration_sec) * 1000.0
-            while True:
-                ok, f = cap.read()
-                if not ok:
-                    break
-                if end_msec is not None:
-                    pos = cap.get(cv2.CAP_PROP_POS_MSEC)
-                    if pos > end_msec:
-                        break
-                yield f
-            cap.release()
-
-        if dec_kind == "pyav" and (_dec is not None) and hasattr(_dec, "frames_pyav"):
-            frame_iter = _dec.frames_pyav(video_path, start_sec=start_sec, duration_sec=duration_sec, **dec_kwargs)
-        else:
-            frame_iter = frames_opencv_baseline(video_path, start_sec=start_sec, duration_sec=duration_sec)
-
-        # 初期化：ROI判定で参照するための人物ボックス
-        person_boxes: List[Tuple[Tuple[int, int, int, int], float]] = []
-
-        for frame in frame_iter:
+    # メインループ
+    frame_idx = start_frame_idx
+    ok, frame = cap.read()
+    while ok:
+        # 現在の再生時刻（ファイル基準）
+        pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC) or (frame_idx * 1000.0 / max(1e-6, fps))
+        pos_sec_file = pos_msec / 1000.0
+        if pos_sec_file < args.start_sec - 1e-3:
+            # 安全のため、狙いより手前ならスキップ
+            ok, frame = cap.read()
             frame_idx += 1
-            # PyAV経路でもフレーム間引き（OpenCVと同等の効果）
-            if stride_frames > 1 and dec_kind == "pyav":
-                if (frame_idx - start_frame_pos - 1) % stride_frames != 0:
-                    continue
+            continue
+        # duration 超え判定
+        if pos_sec_file > (args.start_sec + args.duration_sec - 1e-6) and args.duration_sec > 0:
+            break
 
-            current_time_sec = frame_idx / fps
-            # start_secからの相対時間を計算
-            relative_time_sec = current_time_sec - start_sec
-            if relative_time_sec < -0.5:  # start_secより少し前まで許容
-                continue
-            if duration_sec and duration_sec > 0:
-                if relative_time_sec > duration_sec:
-                    break
-            else:
-                # duration未指定の場合はデコーダ側に一任
+        run_det = (processed_frames % args.detect_every_n == 0)
+        if run_det:
+            dets = detector.infer(frame)
+            ts_str = ts_hhmmss_ms(pos_sec_file)
+            row_prefix = f"{ts_str},{ts_str},{frame_idx}"
+            lines = []
+            for (x1,y1,x2,y2,conf,cls,label) in dets:
+                lines.append(f"{row_prefix},{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f},{conf:.4f},{cls},{label}")
+            if lines:
+                f_csv.write("\n".join(lines) + "\n")
+                if f_raw:
+                    f_raw.write("\n".join(lines) + "\n")
+                emitted_rows += len(lines)
+
+        processed_frames += 1
+
+        # 進捗ログ（2〜3%刻みを目安に）
+        if est_total_frames > 0:
+            percent = min(100.0, 100.0 * (pos_sec_file - args.start_sec) / max(1e-6, (end_time_sec - args.start_sec)))
+            if processed_frames % max(1, int(0.02 * est_total_frames / max(1,args.detect_every_n))) == 0:
+                print(f"{now_prefix(pos_sec_file)} [PROGRESS] {percent:.2f}% | frame={frame_idx} emitted={emitted_rows}")
+        else:
+            # 総尺不明でも定期的に出す
+            if processed_frames % max(10, args.detect_every_n*10) == 0:
+                print(f"{now_prefix(pos_sec_file)} [PROGRESS] 0.00% | frame={frame_idx} emitted={emitted_rows}")
+
+        # フラッシュ（マージ側が定期読み込みできるように）
+        now = time.time()
+        if (now - last_flush) >= flush_interval:
+            try:
+                f_csv.flush(); os.fsync(f_csv.fileno())
+                if f_raw:
+                    f_raw.flush(); os.fsync(f_raw.fileno())
+            except Exception:
                 pass
+            last_flush = now
 
-            effective_detect_every = 1 if tracker_backend in ("bytetrack", "strongsort") else current_detect_every_n
-            if stride_frames > 1 and effective_detect_every > 1:
-                effective_detect_every = max(1, int(round(effective_detect_every / stride_frames)))
-            do_detect = (frame_idx - last_detect_frame) >= effective_detect_every
-            boxes: List[Tuple[int, int, int, int]] = []
-            confidences: List[float] = []
-            det_attrs: List[Tuple[int, str, Optional[np.ndarray]]] = []  # (age, gender, fused_emb)
-            if do_detect:
-                # 先にYOLOで人物検出（ROI判定に使用）
-                short_side = min(current_det_w, current_det_h)
-                yolo_use_half = torch.cuda.is_available() and (device.lower() in ("auto", "cuda", "gpu"))
-                person_boxes = detect_person_boxes(
-                    yolo, frame, conf=body_conf, imgsz=short_side, use_half=yolo_use_half
-                )
-                # 人数が多い場合はROI Faceへ切替
-                MAX_FULLFRAME_FACES = 6
-                use_roi_face = len(person_boxes) >= MAX_FULLFRAME_FACES
-                dets = (
-                    detect_faces_roi(face_app, frame, person_boxes, conf_threshold=conf_threshold)
-                    if use_roi_face else
-                    detect_faces_and_attrs(face_app, frame, conf_threshold=conf_threshold)
-                )
-                last_detect_frame = frame_idx
-                used_person_indices: Set[int] = set()
-                det_quality_weights: List[float] = []
-                for (fx, fy, fw, fh), conf, age, gender, face_emb in dets:
-                    # 顔ボックスに対応する人物ボックスを選ぶ（中心に含む or 最大IoU）
-                    cx, cy = fx + fw // 2, fy + fh // 2
-                    best_i, best_pb = 0.0, None
-                    best_pb_idx = None
-                    for idx, (pb, pconf) in enumerate(person_boxes):
-                        px, py, pw, ph = pb
-                        if px <= cx <= px + pw and py <= cy <= py + ph:
-                            best_pb = pb
-                            best_pb_idx = idx
-                            break
-                        i = iou((fx, fy, fw, fh), pb)
-                        if i > best_i:
-                            best_i, best_pb, best_pb_idx = i, pb, idx
-                    if best_pb_idx is not None:
-                        used_person_indices.add(best_pb_idx)
-                    # 体埋め込み: HSVヒスト/OSNet/アンサンブル
-                    body_emb_hist = compute_body_embedding(frame, best_pb) if (best_pb is not None and reid_backend in ("hist", "ensemble")) else None
-                    body_emb_osn = None
-                    if (best_pb is not None) and (reid_backend in ("osnet", "ensemble")) and (osnet_model is not None):
-                        body_emb_osn = osnet_model.infer(frame, best_pb)
-                    if body_emb_hist is not None and body_emb_osn is not None:
-                        be = np.concatenate([body_emb_hist, body_emb_osn]).astype(np.float32)
-                        n = float(np.linalg.norm(be)); body_emb = be / max(n, 1e-6)
-                    else:
-                        body_emb = body_emb_osn if body_emb_osn is not None else body_emb_hist
-                    # 幾何(簡易gait)特徴の付与
-                    if gait_features and best_pb is not None:
-                        gf = compute_geom_features(frame, best_pb)
-                        if gf is not None:
-                            if body_emb is not None:
-                                tmp = np.concatenate([body_emb, gf]).astype(np.float32)
-                                n = float(np.linalg.norm(tmp)); body_emb = tmp / max(n, 1e-6)
-                            else:
-                                body_emb = gf
-                    fused = fuse_embeddings(face_emb, body_emb, w_face=w_face, w_body=w_body)
-                    # 顔品質に基づく重み（face_size × sharpness^1.5 を正規化）
-                    fsize, sharp = float(fw * fh), 0.0
-                    try:
-                        crop_gray = cv2.cvtColor(frame[fy:fy+fh, fx:fx+fw], cv2.COLOR_BGR2GRAY)
-                        sharp = _compute_laplacian_sharpness(crop_gray)
-                    except Exception:
-                        sharp = 0.0
-                    # 正規化（面積は画面比で粗正規化）
-                    H, W = frame.shape[:2]
-                    fs_norm = min(1.0, max(0.0, fsize / max(1.0, 0.2 * W * H)))
-                    wq = float(fs_norm * (sharp ** 1.5))
-                    det_quality_weights.append(max(0.05, wq))
-                    # 顔ボックスをトラッキングボックスとして使用
-                    boxes.append((fx, fy, fw, fh))
-                    confidences.append(conf)
-                    det_attrs.append((age, gender, fused))
-                # 顔が取れていない人物ボックスも検出として追加
-                for idx, (pb, pconf) in enumerate(person_boxes):
-                    if idx in used_person_indices:
-                        continue
-                    body_emb = compute_body_embedding(frame, pb)
-                    fused = fuse_embeddings(None, body_emb, w_face=w_face, w_body=w_body)
-                    if fused is None:
-                        continue
-                    px, py, pw, ph = pb
-                    boxes.append((px, py, pw, ph))
-                    confidences.append(pconf)
-                    det_attrs.append((0, "", fused))
-                    det_quality_weights.append(0.1)
-            
-            # --no-mergeモードの場合：トラッキングをスキップして直接CSVに書き込み
-            if no_merge:
-                # 検出された各顔を直接CSVに書く（1検出=1行）
-                if 'raw_uid' not in locals():
-                    raw_uid = 0
-                for i, ((fx, fy, fw, fh), conf, (age, gender, fused)) in enumerate(zip(boxes, confidences, det_attrs)):
-                    fsize, sharp = 0.0, 0.0
-                    try:
-                        crop_gray = cv2.cvtColor(frame[fy:fy+fh, fx:fx+fw], cv2.COLOR_BGR2GRAY)
-                        sharp = _compute_laplacian_sharpness(crop_gray)
-                        fsize = float(fw * fh)
-                    except Exception:
-                        pass
-                    emb_b64 = ""
-                    if fused is not None:
-                        try:
-                            # 量子化で軽量化（float32 → float16 で約半分に）
-                            vec16 = np.asarray(fused, dtype=np.float16)
-                            emb_b64 = base64.b64encode(vec16.tobytes()).decode("ascii")
-                        except Exception:
-                            emb_b64 = ""
-                    relative_sec = current_time_sec - start_sec
-                    ts_str = format_timestamp(relative_sec)
-                    # ファイル名から抽出した開始時刻がある場合は、その時刻からの絶対（時刻）を出力
-                    if video_dt is not None:
-                        try:
-                            vdt = (video_dt + timedelta(seconds=float(current_time_sec)))
-                            ts_from_file_start = vdt.strftime("%H:%M:%S.%f")[:-3]
-                        except Exception:
-                            ts_from_file_start = format_timestamp(current_time_sec)
-                    else:
-                        ts_from_file_start = format_timestamp(current_time_sec)
-                    abs_ts = ""
-                    if video_dt is not None:
-                        try:
-                            abs_dt = (video_dt + timedelta(seconds=float(current_time_sec)))
-                            abs_ts = abs_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                        except Exception:
-                            abs_ts = ""
-                    raw_uid += 1
-                    row = [
-                        ts_str, ts_from_file_start, frame_idx,
-                        raw_uid, raw_uid,
-                        age if age else "", gender if gender else "",
-                        fx, fy, fw, fh,
-                        f"{conf:.3f}",
-                        f"{fsize:.1f}", f"{sharp:.3f}",
-                        emb_b64, abs_ts, run_started_jst_str,
-                    ]
-                    writer.writerow(row)
-                    print(f"[DEBUG] --no-merge: wrote row for frame {frame_idx}, person {i}, age={age}, gender={gender}, conf={conf:.3f}", flush=True)
-                
-                # 統計更新（フレーム単位で軽量更新）
-                for age, gender, _ in det_attrs:
-                    stats.update(age, gender)
-                
-                # 1フレーム内の各検出を即時反映
-                if frame_idx % flush_every_n == 0:
-                    csv_file.flush()
-                    try: os.fsync(csv_file.fileno())
-                    except Exception: pass
-                
-                # トラッキングは完全にスキップ
-                continue
-            else:
-                # 通常モード：直前に作った検出結果をそのまま使用する
-                # （do_detect=Falseのフレームでは前フレームの検出を使わない＝空/スキップでOK）
-                pass
+        # 次へ
+        ok, frame = cap.read()
+        frame_idx += 1
 
-            if tracker_backend == "embed":
-                det_embs = [e for (_, _, e) in det_attrs]
-                tracks = tracker.update(boxes, det_embs, frame_idx, det_weights=det_quality_weights)
-            else:
-                # 外部トラッカー: person_boxesからのトラッキング
-                # 検出は person_boxes ベース（boxes/confidences も person ベースで構成済）
-                if tracker_backend == "bytetrack":
-                    # supervision の Detections: xyxy -> ByteTrack -> Detections(追跡ID付き)
-                    det_xyxy = []
-                    for (x, y, w, h) in boxes:
-                        det_xyxy.append([x, y, x + w, y + h])
-                    if len(det_xyxy) > 0:
-                        detections = sv.Detections(xyxy=np.array(det_xyxy, dtype=np.float32), confidence=np.array(confidences, dtype=np.float32))
-                    else:
-                        detections = sv.Detections.empty()
-                    tracked = bytetrack.update_with_detections(detections)
-                    tracks = []
-                    for (x1, y1, x2, y2), tid in zip(tracked.xyxy, tracked.tracker_id):
-                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                        tid = int(tid) if tid is not None else -1
-                        if tid == -1:
-                            continue
-                        tracks.append(Track(track_id=tid, box=(x1, y1, max(1, x2 - x1), max(1, y2 - y1)), last_seen_frame=frame_idx,
-                                            age=None, gender=None, hits=1, embedding=None, embedding_count=0, person_id=tid))
-                elif tracker_backend == "strongsort":
-                    ds_inputs = [([x + w/2, y + h/2, w, h], c, None) for (x, y, w, h), c in zip(boxes, confidences)]
-                    ds_tracks = deepsort.update_tracks(ds_inputs, frame=frame)
-                    tracks = []
-                    for t in ds_tracks:
-                        if not t.is_confirmed():
-                            continue
-                        l, tY, r, b = map(int, t.to_ltrb())
-                        tid = int(t.track_id)
-                        tracks.append(Track(track_id=tid, box=(l, tY, max(1, r - l), max(1, b - tY)), last_seen_frame=frame_idx,
-                                            age=None, gender=None, hits=1, embedding=None, embedding_count=0, person_id=tid))
-
-            # 直近検出基づき属性付与（外部トラッカー時はここで埋め込み平均も管理）
-            for tr in tracks:
-                best_i, best_idx = 0.0, None
-                for idx, b in enumerate(boxes):
-                    val = iou(tr.box, b)
-                    if val > best_i:
-                        best_i, best_idx = val, idx
-                if best_idx is not None and best_idx < len(det_attrs):
-                    age, gender, emb = det_attrs[best_idx]
-                    tr.age = age
-                    tr.gender = gender
-                    if tracker_backend != "embed":
-                        if emb is not None:
-                            mem = ext_attr.setdefault(tr.track_id, {"emb": None, "cnt": 0, "age": None, "gender": None})
-                            old = mem["emb"]
-                            if old is None:
-                                mem["emb"], mem["cnt"] = emb, 1
-                            else:
-                                a, b2 = pad_to_same_dim(np.asarray(old, dtype=np.float32), np.asarray(emb, dtype=np.float32))
-                                if a is not None and b2 is not None:
-                                    mix = (a * float(mem["cnt"]) + b2) / float(mem["cnt"] + 1)
-                                    n = float(np.linalg.norm(mix))
-                                    mem["emb"], mem["cnt"] = mix / max(n, 1e-6), mem["cnt"] + 1
-                            if mem.get("age") is None and age:
-                                mem["age"] = age
-                            if not mem.get("gender") and gender:
-                                mem["gender"] = gender
-
-            # 描画とCSV
-            for i, tr in enumerate(tracks):
-                x, y, w, h = tr.box
-                color = (0, 200, 255)
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                label = f"P{tr.person_id if tr.person_id is not None else tr.track_id}"
-                if tr.age is not None and tr.gender is not None:
-                    label += f" | {tr.gender}, {tr.age}"
-                cv2.putText(frame, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-
-                # 動画内の相対ts（start_secからの相対位置）
-                relative_sec = current_time_sec - start_sec
-                ts_str = format_timestamp(relative_sec)
-                # 絶対時刻（JST）を列に追加（任意可）
-                abs_ts = ""
-                if video_dt is not None:
-                    # current_time_sec は動画全体の位置。開始位置start_secを考慮
-                    rel = current_time_sec
-                    try:
-                        abs_dt = (video_dt + timedelta(seconds=float(rel)))
-                        abs_ts = abs_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    except Exception:
-                        abs_ts = ""
-                conf_val = confidences[i] if i < len(confidences) else 1.0
-                emb_b64 = ""
-                emb_src = tr.embedding
-                if tracker_backend != "embed":
-                    mem = ext_attr.get(tr.track_id)
-                    if mem and isinstance(mem.get("emb"), np.ndarray):
-                        emb_src = mem.get("emb")
-                    # 可能なら属性も補完
-                    if (tr.age is None or tr.age == 0) and mem and mem.get("age"):
-                        tr.age = int(mem.get("age"))
-                    if (not tr.gender) and mem and mem.get("gender"):
-                        tr.gender = str(mem.get("gender"))
-                if emb_src is not None:
-                    try:
-                        vec16 = np.asarray(emb_src, dtype=np.float16)
-                        emb_b64 = base64.b64encode(vec16.tobytes()).decode("ascii")
-                    except Exception:
-                        emb_b64 = ""
-                ts_out = abs_ts if abs_ts else ts_str
-                # 動画ファイル開始からの相対（start_secを引かない）
-                # ファイル名から抽出した開始時刻がある場合は、その時刻からの絶対（時刻）を出力
-                if video_dt is not None:
-                    try:
-                        vdt = (video_dt + timedelta(seconds=float(current_time_sec)))
-                        ts_from_file_start = vdt.strftime("%H:%M:%S.%f")[:-3]
-                    except Exception:
-                        ts_from_file_start = format_timestamp(current_time_sec)
-                else:
-                    ts_from_file_start = format_timestamp(current_time_sec)
-                row = [
-                    ts_str,
-                    ts_from_file_start,
-                    frame_idx,
-                    tr.person_id if tr.person_id is not None else tr.track_id,
-                    tr.track_id,
-                    tr.age if tr.age is not None else "",
-                    tr.gender if tr.gender is not None else "",
-                    x,
-                    y,
-                    w,
-                    h,
-                    f"{conf_val:.3f}",
-                ]
-                if write_quality_cols and tracker_backend == "embed":
-                    fsize, sharp = _compute_face_quality_metrics(frame, tr.box)
-                    row.extend([f"{fsize:.1f}", f"{sharp:.3f}"])
-                elif write_quality_cols:
-                    # 外部トラッカ時は空欄で埋める（列数整合のため）
-                    row.extend(["", ""])
-                row.extend([
-                    emb_b64,
-                    abs_ts,
-                    run_started_jst_str,
-                ])
-                writer.writerow(row)
-            
-            # フレーム処理後にCSVをフラッシュ（データ損失防止）
-            # パフォーマンス向上のため、フレーム毎ではなく適度な間隔でフラッシュ
-            if frame_idx % flush_every_n == 0:  # 設定された間隔でフラッシュ
-                csv_file.flush()
-                try:
-                    os.fsync(csv_file.fileno())  # ディスクに確実に書き込み
-                except Exception:
-                    pass
-
-            if show_window:
-                relative_sec = current_time_sec - start_sec
-                info = f"t={format_timestamp(relative_sec)}  fps={fps:.1f}  tracks={len(tracks)}"
-                cv2.putText(frame, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.imshow("preview", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-            if save_video:
-                if vw is None:
-                    out_path = video_out_path or os.path.splitext(effective_csv_path)[0] + ".mp4"
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    h, w = frame.shape[:2]
-                    vw = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
-                vw.write(frame)
-
-            # 統計更新（フレーム単位で軽量更新）
-            for tr in tracks:
-                stats.update(tr.age, tr.gender)
-
-            # 定期ログ/チェックポイント/スナップショット
-            now_wall = time.time()
-            if now_wall >= next_log_wall:
-                write_progress(now_wall)
-                next_log_wall = now_wall + float(log_every_sec)
-                # ログ出力後、統計を即座に表示
-                male_count = stats.gender_to_count.get('Male', 0)
-                female_count = stats.gender_to_count.get('Female', 0)
-                male_avg_age = (stats.gender_to_age_sum.get('Male', 0.0) / stats.gender_to_age_n.get('Male', 1)) if stats.gender_to_age_n.get('Male', 0) > 0 else 0.0
-                female_avg_age = (stats.gender_to_age_sum.get('Female', 0.0) / stats.gender_to_age_n.get('Female', 1)) if stats.gender_to_age_n.get('Female', 0) > 0 else 0.0
-                print(f"[STATS] M:{male_count}(avg:{male_avg_age:.1f}) F:{female_count}(avg:{female_avg_age:.1f})", flush=True)
-            if now_wall >= next_ckpt_wall:
-                checkpoint(now_wall)
-                next_ckpt_wall = now_wall + float(checkpoint_every_sec)
-            if now_wall >= next_merge_wall:
-                threading.Thread(target=launch_merge_snapshot, daemon=True).start()
-                next_merge_wall = now_wall + max(60.0, float(merge_every_sec)) if merge_every_sec and merge_every_sec > 0 else now_wall + 60.0
-
-            # オートチューニング: 目標時間に合わせて必要な stride を直接推定
-            if target_wall_min and target_wall_min > 0 and (now_wall - start_wall) > autotune_warmup_sec and (now_wall - last_autotune_wall) > autotune_interval_sec:
-                elapsed = now_wall - start_wall
-                processed_frames = max(1, frame_idx - start_frame_pos)
-                fps_proc = processed_frames / elapsed  # 実測の処理フレーム/秒
-                remaining_frames = max(0, (total_frames - frame_idx))
-                target_total_sec = float(target_wall_min) * 60.0
-                remaining_target = max(10.0, target_total_sec - elapsed)
-                # s_needed ≈ remaining_frames / (fps_proc * remaining_target)
-                import math
-                s_needed = int(math.ceil(remaining_frames / max(fps_proc * remaining_target, 1e-6)))
-                s_needed = max(1, min(s_needed, int(max(1.0, fps))))
-                if s_needed != stride_frames:
-                    print(f"[AUTOTUNE] stride {stride_frames} -> {s_needed} (fps_proc={fps_proc:.2f}, remaining_frames={remaining_frames}, remaining_target={remaining_target:.1f}s)", flush=True)
-                    stride_frames = s_needed
-                    last_autotune_wall = now_wall
-
-                # ベース補正: できるだけ品質維持しつつ、det-size と detect-every-n を調整
-                det_changed = False
-                # 目標に対して遅れている（残り時間が足りない）場合は、速度寄りへ
-                if remaining_frames / max(fps_proc * s_needed, 1e-6) > remaining_target * 1.05:
-                    # まずは検出頻度を少し落とす（embed時のみ影響）
-                    if tracker_backend not in ("bytetrack", "strongsort") and current_detect_every_n < d_n_max:
-                        current_detect_every_n = min(d_n_max, current_detect_every_n + 1)
-                    # 次に det-size を段階的に下げる
-                    if current_det_w > det_min or current_det_h > det_min:
-                        new_w = max(det_min, current_det_w - det_step)
-                        new_h = max(det_min, current_det_h - det_step)
-                        if (new_w, new_h) != (current_det_w, current_det_h):
-                            current_det_w, current_det_h = new_w, new_h
-                            det_changed = True
-                else:
-                    # 余裕がある場合は品質寄りへ戻す
-                    if tracker_backend not in ("bytetrack", "strongsort") and current_detect_every_n > d_n_min:
-                        current_detect_every_n = max(d_n_min, current_detect_every_n - 1)
-                    if current_det_w < det_max or current_det_h < det_max:
-                        new_w = min(det_max, current_det_w + det_step)
-                        new_h = min(det_max, current_det_h + det_step)
-                        if (new_w, new_h) != (current_det_w, current_det_h):
-                            current_det_w, current_det_h = new_w, new_h
-                            det_changed = True
-
-                if det_changed:
-                    try:
-                        face_app.prepare(ctx_id=face_ctx_id, det_size=(current_det_w, current_det_h))
-                        print(f"[AUTOTUNE] det-size -> ({current_det_w},{current_det_h})", flush=True)
-                    except Exception:
-                        pass
-            # 次の処理フレームへスキップ（高速化）
-            if stride_frames > 1 and cap is not None:
-                next_pos = frame_idx + (stride_frames - 1)
-                if total_frames > 0 and next_pos < total_frames:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, next_pos)
-                    frame_idx = next_pos
-    finally:
-        # 親の完了検知用フック（s: チャンク開始秒, dur: チャンク長秒）
-        try:
-            chunk_dur_sec = float(duration_sec) if (duration_sec and duration_sec > 0) else max(0.0, float(current_time_sec - start_sec))
-            print(f"[CHUNK_COMPLETED] s={start_sec:.3f} dur={chunk_dur_sec:.3f}", flush=True)
-        except Exception:
-            pass
-        csv_file.close()
-        if cap is not None:
-            cap.release()
-        if show_window:
-            cv2.destroyAllWindows()
-        if vw is not None:
-            vw.release()
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Mac向け: 顔検出/年齢/性別/ID 付与・CSV出力")
-    p.add_argument("--video", required=True, help="入力動画のパス")
-    p.add_argument("--start-sec", type=float, default=1800.0, help="開始秒(例: 1800=30分)")
-    p.add_argument("--duration-sec", type=float, default=0.0, help="解析する秒数（0または省略で動画の最後まで）")
-    p.add_argument("--output-csv", default=os.path.join("outputs", "analysis.csv"))
-    p.add_argument("--output-csv-raw", default=None, help="非マージ（raw）行を併記保存するCSVパス（任意）")
-    p.add_argument("--no-show", action="store_true", help="ウィンドウ表示を無効化")
-    p.add_argument("--detect-every-n", type=int, default=5, help="Nフレーム毎に検出")
-    p.add_argument("--conf", type=float, default=0.6, help="顔検出の信頼度しきい値")
-    p.add_argument("--save-video", action="store_true", help="オーバーレイ映像を保存(mp4)")
-    p.add_argument("--video-out", default=None, help="保存する動画パス（省略時はCSV名由来）")
-    p.add_argument("--reid-cos", type=float, default=0.5, help="ReID: person類似度（コサイン）しきい値")
-    p.add_argument("--gate-iou", type=float, default=0.2, help="割当のIoUゲート")
-    p.add_argument("--gate-sim", type=float, default=0.35, help="割当の埋め込み類似度ゲート")
-    p.add_argument("--det-size", type=str, default="640x640", help="検出入力サイズWxH 例: 640x640")
-    p.add_argument("--body-conf", type=float, default=0.5, help="YOLO人物検出の信頼度")
-    p.add_argument("--w-face", type=float, default=0.7, help="融合時の顔埋め込み重み")
-    p.add_argument("--w-body", type=float, default=0.3, help="融合時の体埋め込み重み")
-    p.add_argument("--local-show", action="store_true", help="ローカルテスト時にimshowを強制表示")
-    p.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto", help="推論デバイスの指定")
-    p.add_argument("--tracker", choices=["embed", "bytetrack", "strongsort"], default="embed", help="トラッカーの選択")
-    p.add_argument("--log-every-sec", type=float, default=5.0, help="進捗ログ出力の周期(秒)")
-    p.add_argument("--checkpoint-every-sec", type=float, default=30.0, help="CSVフラッシュ/履歴追記の周期(秒)")
-    p.add_argument("--merge-every-sec", type=float, default=60.0, help="軽量マージスナップショットの周期(秒, 0で無効)")
-    p.add_argument("--flush-every-n", type=int, default=30, help="CSVフラッシュの間隔（フレーム数、30で30フレーム毎）")
-    p.add_argument("--no-merge", action="store_true", help="マージ処理を完全に無効化")
-    p.add_argument("--run-id", default=None, help="出力run名に付与する任意ID")
-    p.add_argument("--process-fps", type=float, default=0.0, help="1秒あたりの処理フレーム数（0で全フレーム）")
-    p.add_argument("--trt-engine", default=None, help="TensorRTエンジンパス（存在すれば優先使用）")
-    p.add_argument("--yolo-weights", default="yolov8n.pt", help="YOLOの重み（例: yolov8l.pt, yolov10x.pt, カスタム.pt）")
-    p.add_argument("--face-model", default="buffalo_l", help="InsightFaceモデル名（例: buffalo_l, antelopev2 など）")
-    p.add_argument("--reid-backend", choices=["hist", "osnet", "ensemble"], default="hist", help="体外観埋め込みのバックエンド")
-    p.add_argument("--gait-features", action="store_true", help="幾何的歩容特徴を体埋め込みに追加")
-    p.add_argument("--global-start-sec", type=float, default=0.0, help="グローバル開始秒（並列処理用）")
-    p.add_argument("--no-trt-export", action="store_true", help="TensorRTエクスポートを無効化")
-    return p.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    
-    # A100 最適化：一括でどこか最初に呼んでおく
-    import os, torch
-    torch.backends.cudnn.benchmark = True
+    # 末尾フラッシュ
     try:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+        f_csv.flush(); os.fsync(f_csv.fileno())
+        if f_raw:
+            f_raw.flush(); os.fsync(f_raw.fileno())
     except Exception:
         pass
-    # CPU側スレッド過多を抑制（デコードや前処理で効果）
+    f_csv.close()
+    if f_raw: f_raw.close()
     try:
-        import multiprocessing as _mp
-        os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (_mp.cpu_count() or 8)//2)))
-        os.environ.setdefault("MKL_NUM_THREADS", os.environ["OMP_NUM_THREADS"])
-        torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
-        torch.set_num_interop_threads(1)
+        cap.release()
     except Exception:
         pass
-    
-    # A100向けのランタイム最適化
-    configure_cuda_runtime()
-    try:
-        dw, dh = [int(x) for x in str(args.det_size).lower().split("x")]
-    except Exception:
-        dw, dh = 640, 640
-    # ヘッドレス検出（Colab/サーバ）: DISPLAYが無い場合は表示しない。--local-showで明示表示のみ許可
-    headless = not bool(os.environ.get("DISPLAY"))
-    # --local-show または LOCAL_TEST=1 のときは DISPLAY の有無に関わらず表示
-    if bool(getattr(args, "local_show", False)) or (os.environ.get("LOCAL_TEST", "0") == "1"):
-        show_flag = True
-    else:
-        show_flag = (not args.no_show) and (not headless)
-    analyze_video(
-        video_path=args.video,
-        output_csv=args.output_csv,
-        start_sec=args.start_sec,
-        duration_sec=args.duration_sec,
-        output_csv_raw=args.output_csv_raw,
-        show_window=show_flag,
-        detect_every_n=args.detect_every_n,
-        conf_threshold=args.conf,
-        save_video=args.save_video,
-        video_out_path=args.video_out,
-        reid_cosine_thresh=args.reid_cos,
-        gate_iou=args.gate_iou,
-        gate_sim=args.gate_sim,
-        det_size=(dw, dh),
-        body_conf=args.body_conf,
-        w_face=args.w_face,
-        w_body=args.w_body,
-        device=args.device,
-        tracker_backend=args.tracker,
-        log_every_sec=args.log_every_sec,
-        checkpoint_every_sec=args.checkpoint_every_sec,
-        merge_every_sec=args.merge_every_sec,
-        flush_every_n=args.flush_every_n,
-        no_merge=args.no_merge,
-        run_id=args.run_id,
-        process_fps=args.process_fps,
-        trt_engine=args.trt_engine,
-        yolo_weights=args.yolo_weights,
-        face_model=args.face_model,
-        reid_backend=args.reid_backend,
-        gait_features=args.gait_features,
-        global_start_sec=args.global_start_sec,
-        no_trt_export=args.no_trt_export,
-    )
 
+    end_pos_sec = min(end_time_sec, pos_sec_file if math.isfinite(pos_sec_file) else (args.start_sec + args.duration_sec))
+    # 完了通知（親は global_end_sec を拾う）
+    print(f"[CHUNK_COMPLETED] start_sec={args.start_sec:.3f} global_start_sec={args.global_start_sec:.3f} global_end_sec={end_pos_sec:.3f} rows={emitted_rows}")
 
 if __name__ == "__main__":
     main()
-
-

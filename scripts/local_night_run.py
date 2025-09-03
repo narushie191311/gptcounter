@@ -53,6 +53,8 @@ def build_cmd(video_path: str, out_dir: str, device: str, raw_name: str, merged_
         "--online-merge", "1",
         "--verify-coverage", "1",
         "--workers", str(max(1, int(workers_cap))) if workers_cap > 0 else "0",
+        # CPU/MPS時はworkersに合わせてシャードも明示
+        *( ["--shards", str(max(1, int(workers_cap)))] if (workers_cap > 0 and device != "cuda") else [] ),
         "--base-output", base_out,
         "--raw-output", raw_out,
         "--extra-args", " ".join(extra),
