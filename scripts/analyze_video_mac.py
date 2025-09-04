@@ -204,7 +204,9 @@ def main():
         "conf","class","label"
     ]
     f_csv = open_csv_append(args.output_csv, header)
-    f_raw = open_csv_append(args.output_csv_raw, header) if args.output_csv_raw else None
+    # RAWはデータ行が発生するまで遅延オープン（ヘッダーだけの空ファイルを防ぐ）
+    raw_path = args.output_csv_raw if args.output_csv_raw else ""
+    f_raw = None
 
     detector = Detector(args)
 
@@ -249,10 +251,23 @@ def main():
                 lines.append(f"{row_prefix},{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f},{conf:.4f},{cls},{label}")
             if lines:
                 f_csv.write("\n".join(lines) + "\n")
-                if f_raw:
-                    f_raw.write("\n".join(lines) + "\n")
+                # RAWは初回書き込み時にだけオープンし、必要ならヘッダーを書いてから追記
+                if raw_path:
+                    if f_raw is None:
+                        try:
+                            ensure_parent(raw_path)
+                            exists = os.path.exists(raw_path)
+                            f_raw = open(raw_path, "a", newline="")
+                            if (not exists) or (os.path.getsize(raw_path) == 0):
+                                f_raw.write(",".join(header) + "\n")
+                                f_raw.flush()
+                                os.fsync(f_raw.fileno())
+                        except Exception:
+                            f_raw = None
+                    if f_raw:
+                        f_raw.write("\n".join(lines) + "\n")
                 emitted_rows += len(lines)
-                if f_raw:
+                if raw_path:
                     emitted_rows_raw += len(lines)
 
         processed_frames += 1
@@ -300,7 +315,26 @@ def main():
     except Exception:
         pass
     f_csv.close()
-    if f_raw: f_raw.close()
+    # RAWファイルがヘッダーのみ（データ行0）の場合は削除して痕跡を残さない
+    try:
+        if f_raw:
+            try:
+                f_raw.flush(); os.fsync(f_raw.fileno())
+            except Exception:
+                pass
+            f_raw.close()
+        if raw_path and os.path.exists(raw_path):
+            # 2行目が存在しなければ（=ヘッダーのみ）、削除
+            try:
+                with open(raw_path, "r") as _rf:
+                    _ = _rf.readline()
+                    second = _rf.readline()
+                if not second:
+                    os.remove(raw_path)
+            except Exception:
+                pass
+    except Exception:
+        pass
     try:
         cap.release()
     except Exception:
